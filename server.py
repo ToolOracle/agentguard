@@ -167,7 +167,7 @@ def init_db():
         agent_id    TEXT NOT NULL,
         tool_name   TEXT NOT NULL,
         reason      TEXT,
-        status      TEXT DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
+        status      TEXT DEFAULT 'pending' CHECK(status IN ('pending','approved','denied','revoked')),
         approved_by TEXT,
         created_at  TEXT NOT NULL,
         resolved_at TEXT
@@ -178,6 +178,20 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_audit_created  ON audit_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_audit_decision ON audit_log(decision);
     CREATE INDEX IF NOT EXISTS idx_rate_agent     ON rate_limits(agent_id);
+
+    CREATE TABLE IF NOT EXISTS agent_states (
+        agent_id    TEXT PRIMARY KEY,
+        state       TEXT NOT NULL DEFAULT 'active'
+                    CHECK(state IN ('active','monitoring','approval_required','suspended','killed')),
+        reason      TEXT,
+        triggered_by TEXT,
+        output_hash TEXT,
+        tenant_id   TEXT,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        expires_at  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_state ON agent_states(state);
     """)
     conn.commit()
 
@@ -498,6 +512,20 @@ async def handle_policy_preflight(args: dict) -> dict:
             decision = "flagged"
             reason += " | Rate limit exceeded"
             matched_policies.append("pol-004")
+
+        # Agent state overrides (persistent escalation from post-scan)
+        _agent_st = get_agent_state(agent_id)
+        if _agent_st == "approval_required" and decision == "allowed":
+            decision = "require_approval"
+            reason += f" | Agent state: approval_required (escalated by post-scan)"
+            matched_policies.append("state-escalation")
+        elif _agent_st == "monitoring" and decision == "allowed":
+            reason += f" | Agent state: monitoring (enhanced audit active)"
+
+        # _force_approval from state gate
+        if args.get("_force_approval") and decision == "allowed":
+            decision = "require_approval"
+            reason += " | Forced approval: agent in approval_required state"
 
         duration_ms = round((time.monotonic() - start) * 1000)
         request_id = make_request_id()
@@ -1424,22 +1452,112 @@ RISKY_TOOL_COMBINATIONS = [
 
 # In-Memory Session Store (Production: Redis/SQLite Tabelle)
 _sessions: dict = {}  # session_id -> {agent_id, tenant, scopes, created_at, expires_at, calls}
-_killed_agents: set = set()  # In-memory cache of killed agent_ids (backed by rate_limits table)
+# ── Agent State Model ────────────────────────────────────────────────────────
+# States: active → monitoring → approval_required → suspended → killed
+# Transitions are one-directional (escalation only), except manual reset.
+#
+# active             = normal operation
+# monitoring         = enhanced audit, all calls logged with extra detail
+# approval_required  = every tool call needs human approval first
+# suspended          = only read-only/public tools allowed
+# killed             = completely blocked, no calls allowed
+#
+_agent_states: dict = {}  # agent_id → {"state": str, "reason": str, ...}
 
-def _load_killed_agents():
-    """Load killed agents from DB on startup."""
+AGENT_STATE_PRIORITY = {"active": 0, "monitoring": 1, "approval_required": 2, "suspended": 3, "killed": 4}
+
+def _load_agent_states():
+    """Load agent states from DB on startup."""
     try:
         conn = get_db()
-        rows = conn.execute("SELECT agent_id FROM rate_limits WHERE window_key='killed'").fetchall()
-        conn.close()
-        for r in rows:
-            _killed_agents.add(r[0])
-        if _killed_agents:
-            logger.info(f"Loaded {len(_killed_agents)} killed agent(s) from DB")
-    except Exception:
-        pass
+        # Migrate: load killed agents from old rate_limits table
+        old_killed = conn.execute("SELECT agent_id FROM rate_limits WHERE window_key='killed'").fetchall()
+        for r in old_killed:
+            _agent_states[r[0]] = {"state": "killed", "reason": "migrated from rate_limits"}
 
-_load_killed_agents()
+        # Load from new agent_states table
+        try:
+            rows = conn.execute("SELECT agent_id, state, reason, triggered_by, output_hash, expires_at FROM agent_states").fetchall()
+            for r in rows:
+                _agent_states[r[0]] = {
+                    "state": r[1], "reason": r[2],
+                    "triggered_by": r[3], "output_hash": r[4], "expires_at": r[5],
+                }
+        except Exception:
+            pass  # table might not exist yet on first run
+
+        conn.close()
+        states_summary = {}
+        for v in _agent_states.values():
+            s = v["state"]
+            states_summary[s] = states_summary.get(s, 0) + 1
+        if states_summary:
+            logger.info(f"Agent states loaded: {states_summary}")
+    except Exception as e:
+        logger.warning(f"Agent state load error: {e}")
+
+_load_agent_states()
+
+def get_agent_state(agent_id: str) -> str:
+    """Get current state for an agent. Default: active."""
+    info = _agent_states.get(agent_id)
+    if not info:
+        return "active"
+    # Check expiry
+    exp = info.get("expires_at")
+    if exp:
+        try:
+            from datetime import datetime, timezone
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > exp_dt:
+                # Expired → reset to active
+                _agent_states.pop(agent_id, None)
+                try:
+                    conn = get_db()
+                    conn.execute("DELETE FROM agent_states WHERE agent_id=?", (agent_id,))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                return "active"
+        except Exception:
+            pass
+    return info["state"]
+
+def set_agent_state(agent_id: str, state: str, reason: str = "", triggered_by: str = "", output_hash: str = "", tenant_id: str = "", ttl_seconds: int = 0):
+    """Set agent state. Only escalation allowed (higher priority), unless force=True via killed."""
+    current = get_agent_state(agent_id)
+    cur_pri = AGENT_STATE_PRIORITY.get(current, 0)
+    new_pri = AGENT_STATE_PRIORITY.get(state, 0)
+
+    if new_pri < cur_pri and state != "active":
+        return False  # Can only escalate, not de-escalate (except reset to active by admin)
+
+    now = ts()
+    expires = None
+    if ttl_seconds > 0:
+        from datetime import datetime, timezone, timedelta
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+    _agent_states[agent_id] = {
+        "state": state, "reason": reason,
+        "triggered_by": triggered_by, "output_hash": output_hash, "expires_at": expires,
+    }
+
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_states (agent_id, state, reason, triggered_by, output_hash, tenant_id, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (agent_id, state, reason, triggered_by, output_hash, tenant_id, now, now, expires)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Agent state write error: {e}")
+
+    logger.info(f"Agent state: {agent_id} → {state} (reason={reason[:50]})")
+    return True
+
 
 
 # ── TOOL 13: cross_tool_anomaly_check ────────────────────────────────────────
@@ -2199,8 +2317,8 @@ async def handle_emergency_kill(args: dict) -> dict:
                 "INSERT OR REPLACE INTO rate_limits (agent_id, window_key, call_count, first_call, last_call) VALUES (?, 'killed', 999999, ?, ?)",
                 (agent_id, ts(), ts())
             )
-            _killed_agents.add(agent_id)
-            actions_taken.append("agent permanently blocked")
+            set_agent_state(agent_id, "killed", reason=reason, triggered_by="emergency_kill")
+            actions_taken.append("agent state → killed (permanent)")
 
         # 4. Audit the emergency event
         request_id = make_request_id()
@@ -2771,18 +2889,37 @@ async def mcp_handler(request: web.Request) -> web.Response:
                 "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}
             })
 
-        # ── Kill gate: killed agents cannot call any tool ──
+        # ── Agent State Gate ──────────────────────────────────────
         _agent_id = tool_args.get("agent_id", "")
-        if _agent_id and _agent_id in _killed_agents:
+        _agent_state = get_agent_state(_agent_id) if _agent_id else "active"
+
+        if _agent_state == "killed":
             return web.json_response({
                 "jsonrpc": "2.0", "id": bid,
                 "result": {"content": [{"type": "text", "text": json.dumps({
                     "error": "AGENT_KILLED",
-                    "message": f"Agent '{_agent_id}' has been permanently blocked by emergency_kill. "
+                    "message": f"Agent '{_agent_id}' has been permanently blocked. "
                                "Manual intervention required to re-enable.",
                     "agent_id": _agent_id,
+                    "state": "killed",
                 })}]}
             })
+
+        if _agent_state == "suspended" and tool_name not in AGENTGUARD_PUBLIC_TOOLS:
+            return web.json_response({
+                "jsonrpc": "2.0", "id": bid,
+                "result": {"content": [{"type": "text", "text": json.dumps({
+                    "error": "AGENT_SUSPENDED",
+                    "message": f"Agent '{_agent_id}' is suspended. Only public tools allowed.",
+                    "agent_id": _agent_id,
+                    "state": "suspended",
+                    "allowed_tools": sorted(AGENTGUARD_PUBLIC_TOOLS),
+                })}]}
+            })
+
+        if _agent_state == "approval_required":
+            # Inject flag so preflight knows to force approval
+            tool_args["_force_approval"] = True
 
         # ── Auth gate: non-public tools require valid Bearer token ──
         if tool_name not in AGENTGUARD_PUBLIC_TOOLS and not _caller:
@@ -2873,14 +3010,28 @@ async def mcp_handler(request: web.Request) -> web.Response:
                             }, indent=2)}]}
                         })
 
-                    # FLAG/WARN: attach scan summary + escalation rules
+                    # FLAG/WARN: attach scan summary + escalation with persistent state
                     if _scan_findings > 0:
                         _escalation = None
-                        if _scan_verdict == "flag":
-                            # Flag = high severity: require approval for next tool call
+                        _esc_agent = tool_args.get("agent_id", "")
+                        if _scan_verdict == "flag" and _esc_agent:
                             _escalation = "next_call_requires_approval"
-                        elif _scan_verdict == "warn":
+                            set_agent_state(
+                                _esc_agent, "approval_required",
+                                reason=f"post-scan flag on {tool_name}: {_scan_findings} findings",
+                                triggered_by=f"POST_SCAN_FLAG:{tool_name}",
+                                output_hash=_output_hash,
+                                ttl_seconds=3600,  # 1 hour escalation window
+                            )
+                        elif _scan_verdict == "warn" and _esc_agent:
                             _escalation = "enhanced_monitoring"
+                            set_agent_state(
+                                _esc_agent, "monitoring",
+                                reason=f"post-scan warn on {tool_name}: {_scan_findings} findings",
+                                triggered_by=f"POST_SCAN_WARN:{tool_name}",
+                                output_hash=_output_hash,
+                                ttl_seconds=1800,  # 30 min monitoring window
+                            )
 
                         result["_post_scan"] = {
                             "verdict": _scan_verdict,
