@@ -2782,6 +2782,57 @@ async def mcp_handler(request: web.Request) -> web.Response:
                     "kya_level": _caller_identity["kya_name"],
                     "client_id": _caller_identity["client_id"][:8] + "..." if _caller_identity["client_id"] else None,
                 }
+
+            # ── POST-EXECUTION: Auto output_safety_scan ──────────────
+            # Skip scanning for AgentGuard's own security tools (no recursion)
+            _SKIP_POST_SCAN = {
+                "output_safety_scan", "emergency_kill", "tool_manifest_verify",
+                "policy_preflight", "tool_risk_score", "decision_explain",
+                "audit_log_write", "audit_log_query", "rate_limit_check",
+            }
+            if tool_name not in _SKIP_POST_SCAN and isinstance(result, dict):
+                try:
+                    _output_text = json.dumps(result, default=str)[:10000]
+                    _scan = await handle_output_safety_scan({
+                        "output": _output_text,
+                        "tool_name": tool_name,
+                        "agent_id": tool_args.get("agent_id", "unknown"),
+                        "strict": False,
+                    })
+                    _scan_verdict = _scan.get("verdict", "clean")
+                    _scan_findings = _scan.get("findings_count", 0)
+
+                    if _scan_verdict == "block":
+                        # BLOCK: Do not return the output
+                        logger.warning(
+                            f"POST-EXEC BLOCK: {tool_name} output blocked "
+                            f"({_scan_findings} findings) for agent {tool_args.get('agent_id','?')}"
+                        )
+                        return web.json_response({
+                            "jsonrpc": "2.0", "id": bid,
+                            "result": {"content": [{"type": "text", "text": json.dumps({
+                                "error": "OUTPUT_BLOCKED",
+                                "message": f"Tool output blocked by post-execution safety scan. "
+                                           f"{_scan_findings} critical finding(s) detected.",
+                                "scan_verdict": _scan_verdict,
+                                "findings": _scan.get("findings", []),
+                                "tool_name": tool_name,
+                                "recommendation": "Output contained sensitive data and was not forwarded.",
+                                "_auth": result.get("_auth"),
+                            }, indent=2)}]}
+                        })
+
+                    # For non-block verdicts, attach scan summary to result
+                    if _scan_findings > 0:
+                        result["_post_scan"] = {
+                            "verdict": _scan_verdict,
+                            "findings_count": _scan_findings,
+                            "note": "Output was scanned for PII/secrets/exfiltration",
+                        }
+                except Exception as _scan_err:
+                    logger.warning(f"Post-exec scan error (non-fatal): {_scan_err}")
+            # ── END POST-EXECUTION ───────────────────────────────────
+
             return web.json_response({
                 "jsonrpc": "2.0", "id": bid,
                 "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
