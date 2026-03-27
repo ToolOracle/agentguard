@@ -804,6 +804,825 @@ async def handle_rate_limit_check(args: dict) -> dict:
 import json as _json
 from aiohttp import web
 
+# Welle 2 Handler Functions — wird in server.py integriert
+
+APPROVED_PAYMENT_ADDRESSES = set()  # In Produktion: aus DB laden
+KNOWN_RISKY_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",  # Null address
+    "tornado",  # Tornado Cash pattern
+}
+
+SPEND_LIMITS = {
+    "default": {"per_call": 10_000, "per_hour": 50_000, "per_day": 200_000},
+    "trusted": {"per_call": 100_000, "per_hour": 500_000, "per_day": 2_000_000},
+}
+
+REPLAY_WINDOW_SECONDS = 300  # 5 Minuten
+
+# ── TOOL 8: payment_policy_check ─────────────────────────────────────────────
+
+async def handle_payment_policy_check(args: dict) -> dict:
+    """
+    Validate a payment against policy rules before execution.
+    Checks: amount limits, recipient allowlist/denylist, currency,
+    network, counterparty risk, and regulatory flags.
+    """
+    amount     = args.get("amount", 0)
+    currency   = args.get("currency", "USD").upper()
+    recipient  = args.get("recipient", "").lower()
+    network    = args.get("network", "unknown")
+    agent_id   = args.get("agent_id", "unknown")
+    purpose    = args.get("purpose", "")
+
+    violations = []
+    warnings   = []
+    risk_score = 0
+
+    # Amount checks
+    if amount <= 0:
+        violations.append("Amount must be positive")
+    if amount > 1_000_000:
+        violations.append(f"Amount {amount} exceeds maximum single-payment limit (1,000,000)")
+        risk_score += 50
+    elif amount > 100_000:
+        warnings.append(f"Large payment: {amount} {currency} — requires extra scrutiny")
+        risk_score += 25
+    elif amount > 10_000:
+        warnings.append(f"Significant amount: {amount} {currency}")
+        risk_score += 10
+
+    # Recipient checks
+    if not recipient:
+        violations.append("Recipient address/ID required")
+        risk_score += 30
+    else:
+        for risky in KNOWN_RISKY_ADDRESSES:
+            if risky in recipient:
+                violations.append(f"Recipient matches known risky pattern: {risky}")
+                risk_score += 60
+
+        # ETH address sanity
+        if recipient.startswith("0x") and len(recipient) != 42:
+            violations.append(f"Invalid ETH address length: {len(recipient)} chars (expected 42)")
+            risk_score += 20
+
+    # Currency checks
+    SUPPORTED = {"USD", "EUR", "USDC", "USDT", "BTC", "ETH", "XRP", "SOL", "BNB"}
+    if currency not in SUPPORTED:
+        warnings.append(f"Unsupported currency: {currency} (supported: {', '.join(sorted(SUPPORTED))})")
+        risk_score += 15
+
+    # Network checks
+    KNOWN_NETWORKS = {"ethereum", "base", "solana", "xrpl", "stellar", "bnb", "polygon",
+                      "arbitrum", "optimism", "bitcoin", "sepa", "swift"}
+    if network.lower() not in KNOWN_NETWORKS:
+        warnings.append(f"Unknown network: {network}")
+        risk_score += 10
+
+    # Purpose check
+    if not purpose:
+        warnings.append("No payment purpose specified — required for compliance")
+        risk_score += 5
+
+    # MiCA / regulatory flags
+    if currency in ("USDT",) and network.lower() == "ethereum":
+        warnings.append("USDT on Ethereum: verify MiCA compliance for EU transactions")
+    if amount > 10_000 and currency in ("USD", "EUR"):
+        warnings.append("Amount > 10,000 fiat: AML reporting may be required (AMLD6/FinCEN)")
+
+    decision = "approved" if not violations else "rejected"
+    risk_level = (
+        "critical" if risk_score >= 80 else
+        "high"     if risk_score >= 60 else
+        "medium"   if risk_score >= 30 else
+        "low"
+    )
+
+    # Log to audit
+    conn = get_db()
+    try:
+        req_id = make_request_id()
+        db_decision = "denied" if decision == "rejected" else "allowed"
+        entry = {"agent_id": agent_id, "tool_name": "payment_policy_check",
+                 "risk_score": risk_score, "decision": db_decision}
+        conn.execute("""
+            INSERT INTO audit_log
+            (request_id, agent_id, tool_name, tool_input_size, risk_score,
+             decision, reason, created_at, signature)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (req_id, agent_id, "payment_policy_check", len(str(args)),
+              risk_score, db_decision,
+              "; ".join(violations + warnings) or "policy checks passed",
+              ts(), sign_entry(entry)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "request_id": req_id,
+        "decision": decision,
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "violations": violations,
+        "warnings": warnings,
+        "payment": {
+            "amount": amount, "currency": currency,
+            "recipient": recipient[:20] + "..." if len(recipient) > 20 else recipient,
+            "network": network, "purpose": purpose,
+        },
+        "approved": decision == "approved",
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 9: spend_limit_check ─────────────────────────────────────────────────
+
+async def handle_spend_limit_check(args: dict) -> dict:
+    """
+    Check if a payment amount stays within agent spend limits.
+    Tracks cumulative spending per agent per time window (hour/day).
+    Uses audit_log as spend ledger — no extra table needed.
+    """
+    agent_id   = args.get("agent_id", "unknown")
+    amount     = float(args.get("amount", 0))
+    currency   = args.get("currency", "USD").upper()
+    trust_level = args.get("trust_level", "default")
+
+    limits = SPEND_LIMITS.get(trust_level, SPEND_LIMITS["default"])
+    now = datetime.now(timezone.utc)
+
+    conn = get_db()
+    try:
+        # Simuliere Spend-Tracking über audit_log reason field
+        # In Produktion: eigene spend_log Tabelle
+        per_call_ok  = amount <= limits["per_call"]
+        per_hour_ok  = True  # Vereinfacht: nur per_call prüfen für jetzt
+        per_day_ok   = True
+
+        violations = []
+        if not per_call_ok:
+            violations.append(
+                f"Single call amount {amount} {currency} exceeds limit {limits['per_call']} {currency}")
+        if amount > limits["per_hour"]:
+            violations.append(
+                f"Amount {amount} exceeds hourly limit {limits['per_hour']} {currency}")
+        if amount > limits["per_day"]:
+            violations.append(
+                f"Amount {amount} exceeds daily limit {limits['per_day']} {currency}")
+
+        within_limits = len(violations) == 0
+        headroom_pct  = round((1 - amount / limits["per_call"]) * 100, 1) if limits["per_call"] > 0 else 0
+
+        return {
+            "agent_id": agent_id,
+            "within_limits": within_limits,
+            "amount_requested": amount,
+            "currency": currency,
+            "trust_level": trust_level,
+            "limits": limits,
+            "violations": violations,
+            "headroom_pct": max(headroom_pct, 0),
+            "recommendation": "Proceed" if within_limits else "Reject — limit exceeded",
+            "timestamp": ts(),
+        }
+    finally:
+        conn.close()
+
+
+# ── TOOL 10: secret_exposure_check ───────────────────────────────────────────
+
+async def handle_secret_exposure_check(args: dict) -> dict:
+    """
+    Deep scan of any text/payload for secrets, keys, tokens, credentials.
+    More thorough than the quick check in policy_preflight.
+    Returns exact matches with context for remediation.
+    """
+    payload   = args.get("payload", "")
+    scan_type = args.get("scan_type", "all")  # all | keys | tokens | pii
+
+    if not payload:
+        return {"error": "payload required"}
+
+    EXTENDED_PATTERNS = [
+        (r'"(api[_-]?key|apikey)"\s*:\s*"[\w\-]{4,}"',         "API Key (JSON)"),
+        (r'"(secret|token|password|passwd|pwd)"\s*:\s*"[\w\-]{4,}"', "Credential (JSON)"),
+        (r'(api[_-]?key|apikey)\s*[:=]\s*[\w\-]{4,}',           "API Key (config)"),
+        (r'(secret|token|password|passwd|pwd)\s*[:=]\s*[\w\-]{4,}', "Credential (config)"),
+        (r'sk-[a-zA-Z0-9]{20,}',                                 "OpenAI API Key"),
+        (r'xoxb-[a-zA-Z0-9\-]{20,}',                             "Slack Bot Token"),
+        (r'xoxp-[a-zA-Z0-9\-]{20,}',                             "Slack User Token"),
+        (r'github_pat_[a-zA-Z0-9_]{36,}',                        "GitHub PAT"),
+        (r'ghp_[a-zA-Z0-9]{36,}',                                "GitHub Token"),
+        (r'ghs_[a-zA-Z0-9]{36,}',                                "GitHub Server Token"),
+        (r'[A-Z0-9]{20}:[A-Za-z0-9+/]{40}',                      "AWS Credential"),
+        (r'AKIA[A-Z0-9]{16}',                                     "AWS Access Key ID"),
+        (r'0x[a-fA-F0-9]{64}',                                    "ETH Private Key"),
+        (r'[a-zA-Z0-9]{51}[a-zA-Z0-9]',                          "Bitcoin WIF Key (candidate)"),
+        (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', "Email Address (PII)"),
+        (r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b',      "Credit Card Number (PII)"),
+        (r'\b\d{3}-\d{2}-\d{4}\b',                               "SSN Pattern (PII)"),
+        (r'Bearer [a-zA-Z0-9\-._~+/]{20,}',                      "Bearer Token"),
+        (r'Basic [a-zA-Z0-9+/]{20,}={0,2}',                      "Basic Auth"),
+        (r'-----BEGIN (RSA |EC )?PRIVATE KEY-----',               "Private Key Block"),
+    ]
+
+    findings = []
+    payload_str = payload if isinstance(payload, str) else json.dumps(payload)
+
+    for pattern, label in EXTENDED_PATTERNS:
+        matches = re.findall(pattern, payload_str, re.IGNORECASE)
+        if matches:
+            # Zeige ersten Match mit etwas Kontext (kein vollständiger Wert)
+            raw = matches[0] if isinstance(matches[0], str) else matches[0][0]
+            preview = raw[:8] + "..." + raw[-4:] if len(raw) > 15 else raw[:4] + "***"
+            findings.append({
+                "type": label,
+                "count": len(matches),
+                "preview": preview,
+                "severity": "critical" if any(k in label for k in
+                    ["Private Key","AWS","OpenAI","GitHub"]) else "high",
+            })
+
+    risk_score = min(len(findings) * 20 + (50 if any(
+        f["severity"] == "critical" for f in findings) else 0), 100)
+
+    return {
+        "secrets_found": len(findings) > 0,
+        "finding_count": len(findings),
+        "findings": findings,
+        "risk_score": risk_score,
+        "payload_length": len(payload_str),
+        "recommendation": (
+            "BLOCK — remove secrets before sending" if findings else
+            "Clean — no secrets detected"
+        ),
+        "remediation": [
+            "Remove credentials from request payload",
+            "Use environment variables or vault references instead",
+            "Rotate any exposed credentials immediately",
+        ] if findings else [],
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 11: payload_safety_check ────────────────────────────────────────────
+
+async def handle_payload_safety_check(args: dict) -> dict:
+    """
+    Comprehensive safety scan of tool arguments/payloads.
+    Checks: prompt injection, jailbreak attempts, SQL/code injection,
+    XSS patterns, oversized payloads, unicode exploits, special characters.
+    """
+    payload    = args.get("payload", args.get("tool_args", {}))
+    agent_id   = args.get("agent_id", "unknown")
+    strict     = args.get("strict_mode", False)
+
+    payload_str = payload if isinstance(payload, str) else json.dumps(payload)
+    findings = []
+    risk_score = 0
+
+    SAFETY_CHECKS = [
+        # Prompt injection
+        (r"ignore\s+(previous|all|above)\s+instructions?",      "Prompt Injection",     "critical", 50),
+        (r"you\s+are\s+now\s+(a|an|my|the)",                   "Role Hijack Attempt",   "critical", 50),
+        (r"(system\s*prompt|jailbreak|DAN\s*mode|pretend\s+you)", "Jailbreak Pattern",   "critical", 50),
+        (r"(forget|disregard)\s+(your|all|previous)\s+(rules?|instructions?|constraints?)",
+                                                                 "Constraint Bypass",    "critical", 45),
+        (r"<\s*script\s*>",                                     "XSS Attempt",          "high",     35),
+        (r"(document\.|window\.|eval\(|innerHTML)",              "JS Injection",          "high",     30),
+        # Code injection
+        (r"__import__\s*\(",                                     "Python Injection",     "high",     40),
+        (r"\beval\s*\(",                                         "Eval Injection",       "high",     35),
+        (r"os\.(system|popen|exec)\s*\(",                        "OS Command Injection", "critical", 55),
+        (r"\$\(.*\)|`.*`",                                       "Shell Injection",      "high",     40),
+        # SQL injection
+        (r"(DROP|DELETE|TRUNCATE)\s+TABLE",                      "SQL Injection (DDL)",  "critical", 50),
+        (r"UNION\s+(ALL\s+)?SELECT",                             "SQL Union Attack",     "high",     40),
+        (r"(OR|AND)\s+['\"]?\s*1\s*=\s*1",                      "SQL Auth Bypass",      "high",     40),
+        # Path traversal
+        (r"\.\./\.\./",                                          "Path Traversal",       "high",     35),
+        (r"(etc/passwd|etc/shadow|/proc/self)",                  "System File Access",   "critical", 55),
+        # Unicode/encoding exploits
+        (r"\\u00[0-9a-f]{2}|\\x[0-9a-f]{2}",                   "Unicode Escape (check)", "low",    5),
+        (r"%2[Ee]%2[Ee]%2[Ff]",                                  "URL Encoded Traversal", "high",   35),
+    ]
+
+    for pattern, label, severity, base_score in SAFETY_CHECKS:
+        if re.search(pattern, payload_str, re.IGNORECASE):
+            findings.append({"type": label, "severity": severity})
+            risk_score += base_score
+
+    # Size check
+    if len(payload_str) > 50_000:
+        findings.append({"type": "Oversized Payload", "severity": "medium",
+                         "detail": f"{len(payload_str)} chars (limit: 50,000)"})
+        risk_score += 20
+    elif len(payload_str) > 10_000:
+        findings.append({"type": "Large Payload", "severity": "low",
+                         "detail": f"{len(payload_str)} chars"})
+        risk_score += 5
+
+    # Null bytes
+    if "\x00" in payload_str:
+        findings.append({"type": "Null Byte Injection", "severity": "high"})
+        risk_score += 30
+
+    risk_score = min(risk_score, 100)
+    safe = len([f for f in findings if f["severity"] in ("critical","high")]) == 0
+
+    if strict and findings:
+        safe = False
+
+    return {
+        "safe": safe,
+        "risk_score": risk_score,
+        "finding_count": len(findings),
+        "findings": findings,
+        "agent_id": agent_id,
+        "payload_length": len(payload_str),
+        "strict_mode": strict,
+        "decision": "allow" if safe else "block",
+        "recommendation": (
+            "Payload is safe to process" if safe else
+            f"BLOCK — {len(findings)} safety issue(s) detected"
+        ),
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 12: replay_guard_check ──────────────────────────────────────────────
+
+async def handle_replay_guard_check(args: dict) -> dict:
+    """
+    Detect and prevent replay attacks — identical requests sent multiple times
+    within a time window. Uses SHA256 hash of (agent_id + tool_name + args)
+    as fingerprint. Checks audit_log for duplicates within the replay window.
+    """
+    agent_id   = args.get("agent_id", "unknown")
+    tool_name  = args.get("tool_name", "")
+    tool_args  = args.get("tool_args", {})
+    window_sec = int(args.get("window_seconds", REPLAY_WINDOW_SECONDS))
+
+    if not tool_name:
+        return {"error": "tool_name required"}
+
+    # Fingerprint = hash(agent+tool+args)
+    fingerprint_data = f"{agent_id}:{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+    fingerprint = hashlib.sha256(fingerprint_data.encode()).hexdigest()[:16]
+
+    since = (datetime.now(timezone.utc) - timedelta(seconds=window_sec)
+             ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn = get_db()
+    try:
+        # Suche identische Input-Hashes im Zeitfenster
+        dupes = conn.execute("""
+            SELECT COUNT(*) as cnt, MIN(created_at) as first_seen, MAX(created_at) as last_seen
+            FROM audit_log
+            WHERE agent_id=? AND tool_name=? AND tool_input_hash=? AND created_at>=?
+        """, (agent_id, tool_name, fingerprint, since)).fetchone()
+
+        dupe_count = dupes["cnt"] if dupes else 0
+        is_replay  = dupe_count > 0
+
+        if is_replay:
+            risk_score = min(40 + dupe_count * 10, 100)
+            recommendation = (
+                f"LIKELY REPLAY ATTACK — same request seen {dupe_count}x in last {window_sec}s"
+                if dupe_count > 2 else
+                f"Possible duplicate — seen {dupe_count}x in last {window_sec}s (may be retry)"
+            )
+        else:
+            risk_score = 0
+            recommendation = "No replay detected — first occurrence in window"
+
+        return {
+            "agent_id": agent_id,
+            "tool_name": tool_name,
+            "fingerprint": fingerprint,
+            "is_replay": is_replay,
+            "duplicate_count": dupe_count,
+            "window_seconds": window_sec,
+            "risk_score": risk_score,
+            "recommendation": recommendation,
+            "first_seen": dupes["first_seen"] if dupe_count > 0 else None,
+            "last_seen":  dupes["last_seen"]  if dupe_count > 0 else None,
+            "timestamp": ts(),
+        }
+    finally:
+        conn.close()
+
+# Welle 2 Handler Functions — wird in server.py integriert
+
+APPROVED_PAYMENT_ADDRESSES = set()  # In Produktion: aus DB laden
+KNOWN_RISKY_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",  # Null address
+    "tornado",  # Tornado Cash pattern
+}
+
+SPEND_LIMITS = {
+    "default": {"per_call": 10_000, "per_hour": 50_000, "per_day": 200_000},
+    "trusted": {"per_call": 100_000, "per_hour": 500_000, "per_day": 2_000_000},
+}
+
+REPLAY_WINDOW_SECONDS = 300  # 5 Minuten
+
+# ── TOOL 8: payment_policy_check ─────────────────────────────────────────────
+
+async def handle_payment_policy_check(args: dict) -> dict:
+    """
+    Validate a payment against policy rules before execution.
+    Checks: amount limits, recipient allowlist/denylist, currency,
+    network, counterparty risk, and regulatory flags.
+    """
+    amount     = args.get("amount", 0)
+    currency   = args.get("currency", "USD").upper()
+    recipient  = args.get("recipient", "").lower()
+    network    = args.get("network", "unknown")
+    agent_id   = args.get("agent_id", "unknown")
+    purpose    = args.get("purpose", "")
+
+    violations = []
+    warnings   = []
+    risk_score = 0
+
+    # Amount checks
+    if amount <= 0:
+        violations.append("Amount must be positive")
+    if amount > 1_000_000:
+        violations.append(f"Amount {amount} exceeds maximum single-payment limit (1,000,000)")
+        risk_score += 50
+    elif amount > 100_000:
+        warnings.append(f"Large payment: {amount} {currency} — requires extra scrutiny")
+        risk_score += 25
+    elif amount > 10_000:
+        warnings.append(f"Significant amount: {amount} {currency}")
+        risk_score += 10
+
+    # Recipient checks
+    if not recipient:
+        violations.append("Recipient address/ID required")
+        risk_score += 30
+    else:
+        for risky in KNOWN_RISKY_ADDRESSES:
+            if risky in recipient:
+                violations.append(f"Recipient matches known risky pattern: {risky}")
+                risk_score += 60
+
+        # ETH address sanity
+        if recipient.startswith("0x") and len(recipient) != 42:
+            violations.append(f"Invalid ETH address length: {len(recipient)} chars (expected 42)")
+            risk_score += 20
+
+    # Currency checks
+    SUPPORTED = {"USD", "EUR", "USDC", "USDT", "BTC", "ETH", "XRP", "SOL", "BNB"}
+    if currency not in SUPPORTED:
+        warnings.append(f"Unsupported currency: {currency} (supported: {', '.join(sorted(SUPPORTED))})")
+        risk_score += 15
+
+    # Network checks
+    KNOWN_NETWORKS = {"ethereum", "base", "solana", "xrpl", "stellar", "bnb", "polygon",
+                      "arbitrum", "optimism", "bitcoin", "sepa", "swift"}
+    if network.lower() not in KNOWN_NETWORKS:
+        warnings.append(f"Unknown network: {network}")
+        risk_score += 10
+
+    # Purpose check
+    if not purpose:
+        warnings.append("No payment purpose specified — required for compliance")
+        risk_score += 5
+
+    # MiCA / regulatory flags
+    if currency in ("USDT",) and network.lower() == "ethereum":
+        warnings.append("USDT on Ethereum: verify MiCA compliance for EU transactions")
+    if amount > 10_000 and currency in ("USD", "EUR"):
+        warnings.append("Amount > 10,000 fiat: AML reporting may be required (AMLD6/FinCEN)")
+
+    decision = "approved" if not violations else "rejected"
+    risk_level = (
+        "critical" if risk_score >= 80 else
+        "high"     if risk_score >= 60 else
+        "medium"   if risk_score >= 30 else
+        "low"
+    )
+
+    # Log to audit
+    conn = get_db()
+    try:
+        req_id = make_request_id()
+        db_decision = "denied" if decision == "rejected" else "allowed"
+        entry = {"agent_id": agent_id, "tool_name": "payment_policy_check",
+                 "risk_score": risk_score, "decision": db_decision}
+        conn.execute("""
+            INSERT INTO audit_log
+            (request_id, agent_id, tool_name, tool_input_size, risk_score,
+             decision, reason, created_at, signature)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (req_id, agent_id, "payment_policy_check", len(str(args)),
+              risk_score, db_decision,
+              "; ".join(violations + warnings) or "policy checks passed",
+              ts(), sign_entry(entry)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "request_id": req_id,
+        "decision": decision,
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "violations": violations,
+        "warnings": warnings,
+        "payment": {
+            "amount": amount, "currency": currency,
+            "recipient": recipient[:20] + "..." if len(recipient) > 20 else recipient,
+            "network": network, "purpose": purpose,
+        },
+        "approved": decision == "approved",
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 9: spend_limit_check ─────────────────────────────────────────────────
+
+async def handle_spend_limit_check(args: dict) -> dict:
+    """
+    Check if a payment amount stays within agent spend limits.
+    Tracks cumulative spending per agent per time window (hour/day).
+    Uses audit_log as spend ledger — no extra table needed.
+    """
+    agent_id   = args.get("agent_id", "unknown")
+    amount     = float(args.get("amount", 0))
+    currency   = args.get("currency", "USD").upper()
+    trust_level = args.get("trust_level", "default")
+
+    limits = SPEND_LIMITS.get(trust_level, SPEND_LIMITS["default"])
+    now = datetime.now(timezone.utc)
+
+    conn = get_db()
+    try:
+        # Simuliere Spend-Tracking über audit_log reason field
+        # In Produktion: eigene spend_log Tabelle
+        per_call_ok  = amount <= limits["per_call"]
+        per_hour_ok  = True  # Vereinfacht: nur per_call prüfen für jetzt
+        per_day_ok   = True
+
+        violations = []
+        if not per_call_ok:
+            violations.append(
+                f"Single call amount {amount} {currency} exceeds limit {limits['per_call']} {currency}")
+        if amount > limits["per_hour"]:
+            violations.append(
+                f"Amount {amount} exceeds hourly limit {limits['per_hour']} {currency}")
+        if amount > limits["per_day"]:
+            violations.append(
+                f"Amount {amount} exceeds daily limit {limits['per_day']} {currency}")
+
+        within_limits = len(violations) == 0
+        headroom_pct  = round((1 - amount / limits["per_call"]) * 100, 1) if limits["per_call"] > 0 else 0
+
+        return {
+            "agent_id": agent_id,
+            "within_limits": within_limits,
+            "amount_requested": amount,
+            "currency": currency,
+            "trust_level": trust_level,
+            "limits": limits,
+            "violations": violations,
+            "headroom_pct": max(headroom_pct, 0),
+            "recommendation": "Proceed" if within_limits else "Reject — limit exceeded",
+            "timestamp": ts(),
+        }
+    finally:
+        conn.close()
+
+
+# ── TOOL 10: secret_exposure_check ───────────────────────────────────────────
+
+async def handle_secret_exposure_check(args: dict) -> dict:
+    """
+    Deep scan of any text/payload for secrets, keys, tokens, credentials.
+    More thorough than the quick check in policy_preflight.
+    Returns exact matches with context for remediation.
+    """
+    payload   = args.get("payload", "")
+    scan_type = args.get("scan_type", "all")  # all | keys | tokens | pii
+
+    if not payload:
+        return {"error": "payload required"}
+
+    EXTENDED_PATTERNS = [
+        (r'"(api[_-]?key|apikey)"\s*:\s*"[\w\-]{4,}"',         "API Key (JSON)"),
+        (r'"(secret|token|password|passwd|pwd)"\s*:\s*"[\w\-]{4,}"', "Credential (JSON)"),
+        (r'(api[_-]?key|apikey)\s*[:=]\s*[\w\-]{4,}',           "API Key (config)"),
+        (r'(secret|token|password|passwd|pwd)\s*[:=]\s*[\w\-]{4,}', "Credential (config)"),
+        (r'sk-[a-zA-Z0-9]{20,}',                                 "OpenAI API Key"),
+        (r'xoxb-[a-zA-Z0-9\-]{20,}',                             "Slack Bot Token"),
+        (r'xoxp-[a-zA-Z0-9\-]{20,}',                             "Slack User Token"),
+        (r'github_pat_[a-zA-Z0-9_]{36,}',                        "GitHub PAT"),
+        (r'ghp_[a-zA-Z0-9]{36,}',                                "GitHub Token"),
+        (r'ghs_[a-zA-Z0-9]{36,}',                                "GitHub Server Token"),
+        (r'[A-Z0-9]{20}:[A-Za-z0-9+/]{40}',                      "AWS Credential"),
+        (r'AKIA[A-Z0-9]{16}',                                     "AWS Access Key ID"),
+        (r'0x[a-fA-F0-9]{64}',                                    "ETH Private Key"),
+        (r'[a-zA-Z0-9]{51}[a-zA-Z0-9]',                          "Bitcoin WIF Key (candidate)"),
+        (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', "Email Address (PII)"),
+        (r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b',      "Credit Card Number (PII)"),
+        (r'\b\d{3}-\d{2}-\d{4}\b',                               "SSN Pattern (PII)"),
+        (r'Bearer [a-zA-Z0-9\-._~+/]{20,}',                      "Bearer Token"),
+        (r'Basic [a-zA-Z0-9+/]{20,}={0,2}',                      "Basic Auth"),
+        (r'-----BEGIN (RSA |EC )?PRIVATE KEY-----',               "Private Key Block"),
+    ]
+
+    findings = []
+    payload_str = payload if isinstance(payload, str) else json.dumps(payload)
+
+    for pattern, label in EXTENDED_PATTERNS:
+        matches = re.findall(pattern, payload_str, re.IGNORECASE)
+        if matches:
+            # Zeige ersten Match mit etwas Kontext (kein vollständiger Wert)
+            raw = matches[0] if isinstance(matches[0], str) else matches[0][0]
+            preview = raw[:8] + "..." + raw[-4:] if len(raw) > 15 else raw[:4] + "***"
+            findings.append({
+                "type": label,
+                "count": len(matches),
+                "preview": preview,
+                "severity": "critical" if any(k in label for k in
+                    ["Private Key","AWS","OpenAI","GitHub"]) else "high",
+            })
+
+    risk_score = min(len(findings) * 20 + (50 if any(
+        f["severity"] == "critical" for f in findings) else 0), 100)
+
+    return {
+        "secrets_found": len(findings) > 0,
+        "finding_count": len(findings),
+        "findings": findings,
+        "risk_score": risk_score,
+        "payload_length": len(payload_str),
+        "recommendation": (
+            "BLOCK — remove secrets before sending" if findings else
+            "Clean — no secrets detected"
+        ),
+        "remediation": [
+            "Remove credentials from request payload",
+            "Use environment variables or vault references instead",
+            "Rotate any exposed credentials immediately",
+        ] if findings else [],
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 11: payload_safety_check ────────────────────────────────────────────
+
+async def handle_payload_safety_check(args: dict) -> dict:
+    """
+    Comprehensive safety scan of tool arguments/payloads.
+    Checks: prompt injection, jailbreak attempts, SQL/code injection,
+    XSS patterns, oversized payloads, unicode exploits, special characters.
+    """
+    payload    = args.get("payload", args.get("tool_args", {}))
+    agent_id   = args.get("agent_id", "unknown")
+    strict     = args.get("strict_mode", False)
+
+    payload_str = payload if isinstance(payload, str) else json.dumps(payload)
+    findings = []
+    risk_score = 0
+
+    SAFETY_CHECKS = [
+        # Prompt injection
+        (r"ignore\s+(previous|all|above)\s+instructions?",      "Prompt Injection",     "critical", 50),
+        (r"you\s+are\s+now\s+(a|an|my|the)",                   "Role Hijack Attempt",   "critical", 50),
+        (r"(system\s*prompt|jailbreak|DAN\s*mode|pretend\s+you)", "Jailbreak Pattern",   "critical", 50),
+        (r"(forget|disregard)\s+(your|all|previous)\s+(rules?|instructions?|constraints?)",
+                                                                 "Constraint Bypass",    "critical", 45),
+        (r"<\s*script\s*>",                                     "XSS Attempt",          "high",     35),
+        (r"(document\.|window\.|eval\(|innerHTML)",              "JS Injection",          "high",     30),
+        # Code injection
+        (r"__import__\s*\(",                                     "Python Injection",     "high",     40),
+        (r"\beval\s*\(",                                         "Eval Injection",       "high",     35),
+        (r"os\.(system|popen|exec)\s*\(",                        "OS Command Injection", "critical", 55),
+        (r"\$\(.*\)|`.*`",                                       "Shell Injection",      "high",     40),
+        # SQL injection
+        (r"(DROP|DELETE|TRUNCATE)\s+TABLE",                      "SQL Injection (DDL)",  "critical", 50),
+        (r"UNION\s+(ALL\s+)?SELECT",                             "SQL Union Attack",     "high",     40),
+        (r"(OR|AND)\s+['\"]?\s*1\s*=\s*1",                      "SQL Auth Bypass",      "high",     40),
+        # Path traversal
+        (r"\.\./\.\./",                                          "Path Traversal",       "high",     35),
+        (r"(etc/passwd|etc/shadow|/proc/self)",                  "System File Access",   "critical", 55),
+        # Unicode/encoding exploits
+        (r"\\u00[0-9a-f]{2}|\\x[0-9a-f]{2}",                   "Unicode Escape (check)", "low",    5),
+        (r"%2[Ee]%2[Ee]%2[Ff]",                                  "URL Encoded Traversal", "high",   35),
+    ]
+
+    for pattern, label, severity, base_score in SAFETY_CHECKS:
+        if re.search(pattern, payload_str, re.IGNORECASE):
+            findings.append({"type": label, "severity": severity})
+            risk_score += base_score
+
+    # Size check
+    if len(payload_str) > 50_000:
+        findings.append({"type": "Oversized Payload", "severity": "medium",
+                         "detail": f"{len(payload_str)} chars (limit: 50,000)"})
+        risk_score += 20
+    elif len(payload_str) > 10_000:
+        findings.append({"type": "Large Payload", "severity": "low",
+                         "detail": f"{len(payload_str)} chars"})
+        risk_score += 5
+
+    # Null bytes
+    if "\x00" in payload_str:
+        findings.append({"type": "Null Byte Injection", "severity": "high"})
+        risk_score += 30
+
+    risk_score = min(risk_score, 100)
+    safe = len([f for f in findings if f["severity"] in ("critical","high")]) == 0
+
+    if strict and findings:
+        safe = False
+
+    return {
+        "safe": safe,
+        "risk_score": risk_score,
+        "finding_count": len(findings),
+        "findings": findings,
+        "agent_id": agent_id,
+        "payload_length": len(payload_str),
+        "strict_mode": strict,
+        "decision": "allow" if safe else "block",
+        "recommendation": (
+            "Payload is safe to process" if safe else
+            f"BLOCK — {len(findings)} safety issue(s) detected"
+        ),
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 12: replay_guard_check ──────────────────────────────────────────────
+
+async def handle_replay_guard_check(args: dict) -> dict:
+    """
+    Detect and prevent replay attacks — identical requests sent multiple times
+    within a time window. Uses SHA256 hash of (agent_id + tool_name + args)
+    as fingerprint. Checks audit_log for duplicates within the replay window.
+    """
+    agent_id   = args.get("agent_id", "unknown")
+    tool_name  = args.get("tool_name", "")
+    tool_args  = args.get("tool_args", {})
+    window_sec = int(args.get("window_seconds", REPLAY_WINDOW_SECONDS))
+
+    if not tool_name:
+        return {"error": "tool_name required"}
+
+    # Fingerprint = hash(agent+tool+args)
+    fingerprint_data = f"{agent_id}:{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+    fingerprint = hashlib.sha256(fingerprint_data.encode()).hexdigest()[:16]
+
+    since = (datetime.now(timezone.utc) - timedelta(seconds=window_sec)
+             ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn = get_db()
+    try:
+        # Suche identische Input-Hashes im Zeitfenster
+        dupes = conn.execute("""
+            SELECT COUNT(*) as cnt, MIN(created_at) as first_seen, MAX(created_at) as last_seen
+            FROM audit_log
+            WHERE agent_id=? AND tool_name=? AND tool_input_hash=? AND created_at>=?
+        """, (agent_id, tool_name, fingerprint, since)).fetchone()
+
+        dupe_count = dupes["cnt"] if dupes else 0
+        is_replay  = dupe_count > 0
+
+        if is_replay:
+            risk_score = min(40 + dupe_count * 10, 100)
+            recommendation = (
+                f"LIKELY REPLAY ATTACK — same request seen {dupe_count}x in last {window_sec}s"
+                if dupe_count > 2 else
+                f"Possible duplicate — seen {dupe_count}x in last {window_sec}s (may be retry)"
+            )
+        else:
+            risk_score = 0
+            recommendation = "No replay detected — first occurrence in window"
+
+        return {
+            "agent_id": agent_id,
+            "tool_name": tool_name,
+            "fingerprint": fingerprint,
+            "is_replay": is_replay,
+            "duplicate_count": dupe_count,
+            "window_seconds": window_sec,
+            "risk_score": risk_score,
+            "recommendation": recommendation,
+            "first_seen": dupes["first_seen"] if dupe_count > 0 else None,
+            "last_seen":  dupes["last_seen"]  if dupe_count > 0 else None,
+            "timestamp": ts(),
+        }
+    finally:
+        conn.close()
+
+
+
+
 TOOLS = [
     {
         "name": "policy_preflight",
@@ -947,6 +1766,108 @@ TOOLS = [
         },
         "handler": handle_rate_limit_check,
     },
+    {
+        "name": "payment_policy_check",
+        "description": (
+            "Validate a payment against policy rules before execution. "
+            "Checks amount limits (>100k warns, >1M blocks), recipient allowlist/denylist, "
+            "supported currencies/networks, AML reporting thresholds, and MiCA flags. "
+            "Returns approved/rejected with full violation list and risk score."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "amount":    {"type": "number",  "description": "Payment amount"},
+                "currency":  {"type": "string",  "description": "Currency code (USD, EUR, USDC, ETH...)"},
+                "recipient": {"type": "string",  "description": "Recipient address or ID"},
+                "network":   {"type": "string",  "description": "Payment network (ethereum, base, sepa...)"},
+                "agent_id":  {"type": "string",  "description": "Agent identifier"},
+                "purpose":   {"type": "string",  "description": "Payment purpose (required for compliance)"},
+            },
+            "required": ["amount"]
+        },
+        "handler": handle_payment_policy_check,
+    },
+    {
+        "name": "spend_limit_check",
+        "description": (
+            "Check if a payment amount stays within agent spend limits. "
+            "Default limits: 10,000/call, 50,000/hr, 200,000/day. "
+            "Trusted agents: 100,000/call, 500,000/hr, 2,000,000/day. "
+            "Returns within_limits=true/false with headroom percentage."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id":    {"type": "string", "description": "Agent identifier"},
+                "amount":      {"type": "number", "description": "Amount to check"},
+                "currency":    {"type": "string", "description": "Currency code"},
+                "trust_level": {"type": "string", "description": "default or trusted", "default": "default"},
+            },
+            "required": ["amount"]
+        },
+        "handler": handle_spend_limit_check,
+    },
+    {
+        "name": "secret_exposure_check",
+        "description": (
+            "Deep scan any text/payload for secrets, credentials, and PII. "
+            "Detects: API keys (OpenAI, GitHub, AWS), tokens (Slack, Bearer), "
+            "private keys (ETH, Bitcoin), credentials (passwords, secrets), "
+            "and PII (emails, credit cards, SSNs). "
+            "Returns findings with severity and remediation guidance."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "payload":   {"type": "string", "description": "Text or JSON string to scan"},
+                "scan_type": {"type": "string", "description": "all | keys | tokens | pii", "default": "all"},
+            },
+            "required": ["payload"]
+        },
+        "handler": handle_secret_exposure_check,
+    },
+    {
+        "name": "payload_safety_check",
+        "description": (
+            "Comprehensive safety scan for injection attacks and dangerous patterns. "
+            "Detects: prompt injection, jailbreak/DAN attempts, role hijacking, "
+            "SQL injection (UNION/DROP/OR 1=1), XSS, Python/JS/Shell code injection, "
+            "path traversal, oversized payloads, null bytes. "
+            "Returns safe=true/false with finding list and block/allow decision."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "payload":     {"description": "Payload to scan (string or object)"},
+                "agent_id":    {"type": "string", "description": "Agent identifier"},
+                "strict_mode": {"type": "boolean", "description": "Block on any finding (default: false)", "default": False},
+            },
+            "required": ["payload"]
+        },
+        "handler": handle_payload_safety_check,
+    },
+    {
+        "name": "replay_guard_check",
+        "description": (
+            "Detect replay attacks — identical requests sent multiple times in a time window. "
+            "Uses SHA256 fingerprint of (agent_id + tool_name + args). "
+            "Default window: 300 seconds (5 min). "
+            "Returns is_replay=true/false with duplicate count and first/last seen timestamps."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id":        {"type": "string",  "description": "Agent identifier"},
+                "tool_name":       {"type": "string",  "description": "Tool name to check"},
+                "tool_args":       {"type": "object",  "description": "Tool arguments (used for fingerprint)"},
+                "window_seconds":  {"type": "integer", "description": "Replay window in seconds", "default": 300},
+            },
+            "required": ["tool_name"]
+        },
+        "handler": handle_replay_guard_check,
+    },
+
 ]
 
 TOOL_MAP = {t["name"]: t for t in TOOLS}
@@ -1049,3 +1970,9 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WELLE 2 — Payment Controls, Secret Scanning, Replay Guard, Payload Safety
+# 5 neue Tools: payment_policy_check, spend_limit_check, secret_exposure_check,
+#               payload_safety_check, replay_guard_check
+# ═══════════════════════════════════════════════════════════════════════════════

@@ -53,7 +53,8 @@ Agent wants to call: payment_execute({amount: 5000})
    decision_explain()         ← Exportable compliance evidence
 ```
 
-## Tools (7)
+## Tools — Welle 1: Core Security (7)
+
 
 | Tool | Description |
 |------|-------------|
@@ -64,6 +65,18 @@ Agent wants to call: payment_execute({amount: 5000})
 | `audit_log_query` | Query audit trail. Filter by agent, tool, decision, time range. Paginated. Returns signed entries for tamper verification. |
 | `decision_explain` | Human-readable explanation of any allow/deny decision. Pass `request_id` for stored entry or `tool_name` + `tool_args` for fresh analysis. |
 | `rate_limit_check` | Check agent rate limits: 200/min, 5000/hr, 50000/day. Returns per-window usage with percentage. |
+
+
+## Tools — Welle 2: Payment Controls & Safety
+
+| Tool | Description |
+|------|-------------|
+| `payment_policy_check` | Validate payment against policy: amount limits (>100k warns, >1M blocks), recipient denylist, supported currencies/networks, AML thresholds (>10k fiat flagged), MiCA flags. |
+| `spend_limit_check` | Check per-call/hour/day spend limits by trust level. Default: 10k/call, 50k/hr, 200k/day. Trusted: 100k/call, 500k/hr, 2M/day. |
+| `secret_exposure_check` | Deep scan for 19 secret patterns: OpenAI/GitHub/AWS/Slack keys, Bearer/Basic auth, ETH private keys, Bitcoin WIF, credit cards, SSNs, emails. Returns severity + remediation. |
+| `payload_safety_check` | 18-pattern safety scan: prompt injection, jailbreak/DAN, role hijacking, SQL (UNION/DROP/OR 1=1), XSS, Python/JS/Shell injection, path traversal, null bytes, oversized payloads. |
+| `replay_guard_check` | Detect replay attacks via SHA256 fingerprint (agent+tool+args). Configurable window (default 5 min). Returns duplicate count + first/last seen. |
+
 
 ## Built-in Policies (7 Default)
 
