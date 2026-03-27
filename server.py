@@ -1424,6 +1424,22 @@ RISKY_TOOL_COMBINATIONS = [
 
 # In-Memory Session Store (Production: Redis/SQLite Tabelle)
 _sessions: dict = {}  # session_id -> {agent_id, tenant, scopes, created_at, expires_at, calls}
+_killed_agents: set = set()  # In-memory cache of killed agent_ids (backed by rate_limits table)
+
+def _load_killed_agents():
+    """Load killed agents from DB on startup."""
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT agent_id FROM rate_limits WHERE window_key='killed'").fetchall()
+        conn.close()
+        for r in rows:
+            _killed_agents.add(r[0])
+        if _killed_agents:
+            logger.info(f"Loaded {len(_killed_agents)} killed agent(s) from DB")
+    except Exception:
+        pass
+
+_load_killed_agents()
 
 
 # ── TOOL 13: cross_tool_anomaly_check ────────────────────────────────────────
@@ -2183,7 +2199,8 @@ async def handle_emergency_kill(args: dict) -> dict:
                 "INSERT OR REPLACE INTO rate_limits (agent_id, window_key, call_count, first_call, last_call) VALUES (?, 'killed', 999999, ?, ?)",
                 (agent_id, ts(), ts())
             )
-            actions_taken.append("rate limit set to blocked")
+            _killed_agents.add(agent_id)
+            actions_taken.append("agent permanently blocked")
 
         # 4. Audit the emergency event
         request_id = make_request_id()
@@ -2754,6 +2771,19 @@ async def mcp_handler(request: web.Request) -> web.Response:
                 "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"}
             })
 
+        # ── Kill gate: killed agents cannot call any tool ──
+        _agent_id = tool_args.get("agent_id", "")
+        if _agent_id and _agent_id in _killed_agents:
+            return web.json_response({
+                "jsonrpc": "2.0", "id": bid,
+                "result": {"content": [{"type": "text", "text": json.dumps({
+                    "error": "AGENT_KILLED",
+                    "message": f"Agent '{_agent_id}' has been permanently blocked by emergency_kill. "
+                               "Manual intervention required to re-enable.",
+                    "agent_id": _agent_id,
+                })}]}
+            })
+
         # ── Auth gate: non-public tools require valid Bearer token ──
         if tool_name not in AGENTGUARD_PUBLIC_TOOLS and not _caller:
             return web.json_response({
@@ -2802,12 +2832,31 @@ async def mcp_handler(request: web.Request) -> web.Response:
                     _scan_verdict = _scan.get("verdict", "clean")
                     _scan_findings = _scan.get("findings_count", 0)
 
+                    # Compute output hash for audit (BEFORE any redaction)
+                    _output_hash = hashlib.sha256(_output_text.encode()).hexdigest()[:16]
+
                     if _scan_verdict == "block":
-                        # BLOCK: Do not return the output
+                        # BLOCK: Do not return the output — leak-safe
                         logger.warning(
                             f"POST-EXEC BLOCK: {tool_name} output blocked "
                             f"({_scan_findings} findings) for agent {tool_args.get('agent_id','?')}"
                         )
+                        # Audit the block with output hash (NOT the output itself)
+                        try:
+                            _bconn = get_db()
+                            _bconn.execute(
+                                "INSERT INTO audit_log (request_id, agent_id, tool_name, risk_score, decision, reason, signature, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                (make_request_id(), tool_args.get("agent_id","unknown"),
+                                 f"POST_SCAN_BLOCK:{tool_name}", _scan_findings * 25,
+                                 "denied",
+                                 json.dumps({"verdict":"block","output_hash":_output_hash,"findings":[f["type"] for f in _scan.get("findings",[])]})[:200],
+                                 sign_entry({"block":tool_name,"hash":_output_hash}), ts())
+                            )
+                            _bconn.commit()
+                            _bconn.close()
+                        except Exception:
+                            pass
+
                         return web.json_response({
                             "jsonrpc": "2.0", "id": bid,
                             "result": {"content": [{"type": "text", "text": json.dumps({
@@ -2816,19 +2865,46 @@ async def mcp_handler(request: web.Request) -> web.Response:
                                            f"{_scan_findings} critical finding(s) detected.",
                                 "scan_verdict": _scan_verdict,
                                 "findings": _scan.get("findings", []),
+                                "output_hash": _output_hash,
                                 "tool_name": tool_name,
-                                "recommendation": "Output contained sensitive data and was not forwarded.",
+                                "recommendation": "Output contained sensitive data and was not forwarded. "
+                                                  "Original output hash preserved for audit.",
                                 "_auth": result.get("_auth"),
                             }, indent=2)}]}
                         })
 
-                    # For non-block verdicts, attach scan summary to result
+                    # FLAG/WARN: attach scan summary + escalation rules
                     if _scan_findings > 0:
+                        _escalation = None
+                        if _scan_verdict == "flag":
+                            # Flag = high severity: require approval for next tool call
+                            _escalation = "next_call_requires_approval"
+                        elif _scan_verdict == "warn":
+                            _escalation = "enhanced_monitoring"
+
                         result["_post_scan"] = {
                             "verdict": _scan_verdict,
                             "findings_count": _scan_findings,
-                            "note": "Output was scanned for PII/secrets/exfiltration",
+                            "output_hash": _output_hash,
+                            "escalation": _escalation,
+                            "note": "Output was scanned for PII/secrets/exfiltration/poisoning",
                         }
+
+                        # Audit the flag/warn
+                        try:
+                            _fconn = get_db()
+                            _fconn.execute(
+                                "INSERT INTO audit_log (request_id, agent_id, tool_name, risk_score, decision, reason, created_at) VALUES (?,?,?,?,?,?,?)",
+                                (make_request_id(), tool_args.get("agent_id","unknown"),
+                                 f"POST_SCAN_{_scan_verdict.upper()}:{tool_name}", _scan_findings * 15,
+                                 "flagged",
+                                 json.dumps({"verdict":_scan_verdict,"output_hash":_output_hash,"findings_count":_scan_findings})[:200],
+                                 ts())
+                            )
+                            _fconn.commit()
+                            _fconn.close()
+                        except Exception:
+                            pass
                 except Exception as _scan_err:
                     logger.warning(f"Post-exec scan error (non-fatal): {_scan_err}")
             # ── END POST-EXECUTION ───────────────────────────────────
