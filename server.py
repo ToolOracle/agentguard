@@ -1623,6 +1623,704 @@ async def handle_replay_guard_check(args: dict) -> dict:
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WELLE 3 — Cross-Tool Anomaly, Scope Check, Session Validation, Tenant Governance
+# 5 neue Tools: cross_tool_anomaly_check, scope_check, session_validate,
+#               tenant_policy_check, threat_intel_check
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import time as _time
+
+# ── Tenant & Scope Konfiguration ─────────────────────────────────────────────
+
+DEFAULT_TENANT = "default"
+
+# Tool Scopes: welche Tools brauchen welchen Scope
+TOOL_SCOPES = {
+    # Kein Scope nötig (public tools)
+    "policy_preflight": None,
+    "tool_risk_score": None,
+    "decision_explain": None,
+    "audit_log_query": "audit:read",
+    # Schreibende/sensitive Tools
+    "audit_log_write": "audit:write",
+    "approval_required": "approval:read",
+    "rate_limit_check": "monitor:read",
+    # Payment Tools — hohes Scope-Level
+    "payment_policy_check": "payment:check",
+    "spend_limit_check": "payment:check",
+    "payment_execute": "payment:execute",
+    "wallet_transfer": "payment:execute",
+    "wire_transfer": "payment:execute",
+    # Blockchain reads
+    "eth_gas": "blockchain:read",
+    "eth_stablecoin_check": "blockchain:read",
+    "eth_protocol_tvl": "blockchain:read",
+    "eth_rwa_tokenization": "blockchain:read",
+    "eth_wallet_intel": "blockchain:read",
+    "xlm_overview": "blockchain:read",
+    "xrpl_rlusd": "blockchain:read",
+    "bnb_overview": "blockchain:read",
+    "sol_overview": "blockchain:read",
+    "arb_overview": "blockchain:read",
+    # Compliance
+    "mica_status": "compliance:read",
+    "entity_ampel": "compliance:read",
+    "readiness_check": "compliance:read",
+    "aml_sanctions_check": "compliance:read",
+    # Data/PII
+    "secret_exposure_check": "security:scan",
+    "payload_safety_check": "security:scan",
+    "replay_guard_check": "security:scan",
+}
+
+# Scope Hierarchie: welche Scopes beinhalten andere
+SCOPE_HIERARCHY = {
+    "admin": ["audit:read","audit:write","approval:read","approval:write",
+              "monitor:read","payment:check","payment:execute",
+              "blockchain:read","blockchain:write","compliance:read",
+              "compliance:write","security:scan","tenant:admin"],
+    "compliance_officer": ["audit:read","approval:read","compliance:read",
+                            "blockchain:read","security:scan","monitor:read"],
+    "trader": ["blockchain:read","payment:check","payment:execute","audit:read","security:scan"],
+    "auditor": ["audit:read","audit:write","compliance:read","monitor:read"],
+    "developer": ["blockchain:read","security:scan","audit:read","monitor:read"],
+    "readonly": ["blockchain:read","audit:read"],
+}
+
+# Bekannte verdächtige Tool-Kombinationen (sequenziell innerhalb Zeitfenster)
+RISKY_TOOL_COMBINATIONS = [
+    {
+        "combo": ["aml_sanctions_check", "payment_execute"],
+        "window_sec": 60,
+        "risk": 85,
+        "label": "AML check immediately followed by payment — possible bypass attempt",
+    },
+    {
+        "combo": ["payload_safety_check", "payment_execute"],
+        "window_sec": 30,
+        "risk": 70,
+        "label": "Safety check then immediate payment — possible automation without human review",
+    },
+    {
+        "combo": ["eth_wallet_intel", "wallet_transfer"],
+        "window_sec": 120,
+        "risk": 75,
+        "label": "Wallet recon followed by transfer — possible reconnaissance before theft",
+    },
+    {
+        "combo": ["secret_exposure_check", "audit_log_query"],
+        "window_sec": 60,
+        "risk": 60,
+        "label": "Secret scan then audit query — possible data exfiltration probe",
+    },
+    {
+        "combo": ["rate_limit_check", "payment_execute"],
+        "window_sec": 30,
+        "risk": 65,
+        "label": "Rate limit probe then payment — possible rate-limit bypass preparation",
+    },
+    {
+        "combo": ["approval_required", "payment_execute"],
+        "window_sec": 10,
+        "risk": 90,
+        "label": "Approval check then immediate payment under 10s — approval gate likely bypassed",
+    },
+]
+
+# In-Memory Session Store (Production: Redis/SQLite Tabelle)
+_sessions: dict = {}  # session_id -> {agent_id, tenant, scopes, created_at, expires_at, calls}
+
+
+# ── TOOL 13: cross_tool_anomaly_check ────────────────────────────────────────
+
+async def handle_cross_tool_anomaly_check(args: dict) -> dict:
+    """
+    Detect anomalous tool usage patterns across multiple tool calls.
+    Checks recent audit_log for risky sequences, unusual frequency,
+    tool combinations that suggest bypass attempts or reconnaissance.
+    """
+    agent_id    = args.get("agent_id", "unknown")
+    window_sec  = int(args.get("window_seconds", 300))
+    sensitivity = args.get("sensitivity", "medium")  # low / medium / high
+
+    sensitivity_thresholds = {"low": 80, "medium": 60, "high": 40}
+    threshold = sensitivity_thresholds.get(sensitivity, 60)
+
+    since = (datetime.now(timezone.utc) - timedelta(seconds=window_sec)
+             ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn = get_db()
+    try:
+        # Hole die letzten Tool-Calls des Agents in zeitlicher Reihenfolge
+        rows = conn.execute("""
+            SELECT tool_name, decision, risk_score, created_at
+            FROM audit_log
+            WHERE agent_id=? AND created_at>=?
+            ORDER BY created_at ASC
+        """, (agent_id, since)).fetchall()
+
+        tool_sequence = [r["tool_name"] for r in rows]
+        call_count    = len(tool_sequence)
+        anomalies     = []
+        overall_risk  = 0
+
+        # 1. Risky combination check
+        for combo_def in RISKY_TOOL_COMBINATIONS:
+            combo = combo_def["combo"]
+            if len(combo) != 2:
+                continue
+            t1, t2 = combo
+            for i, call in enumerate(tool_sequence):
+                if call == t1:
+                    # Suche t2 innerhalb combo_window
+                    combo_window = combo_def["window_sec"]
+                    t1_time = datetime.fromisoformat(
+                        rows[i]["created_at"].replace("Z", "+00:00"))
+                    for j in range(i+1, len(rows)):
+                        if rows[j]["tool_name"] == t2:
+                            t2_time = datetime.fromisoformat(
+                                rows[j]["created_at"].replace("Z", "+00:00"))
+                            delta = (t2_time - t1_time).total_seconds()
+                            if 0 < delta <= combo_window:
+                                if combo_def["risk"] >= threshold:
+                                    anomalies.append({
+                                        "type": "risky_tool_combination",
+                                        "tools": [t1, t2],
+                                        "delta_seconds": round(delta, 1),
+                                        "risk_score": combo_def["risk"],
+                                        "label": combo_def["label"],
+                                        "severity": "critical" if combo_def["risk"] >= 80 else "high",
+                                    })
+                                    overall_risk = max(overall_risk, combo_def["risk"])
+
+        # 2. Frequency anomaly — zu viele Calls in kurzer Zeit
+        if call_count > 100 and window_sec <= 300:
+            rate = call_count / (window_sec / 60)
+            anomalies.append({
+                "type": "high_frequency",
+                "calls_in_window": call_count,
+                "calls_per_minute": round(rate, 1),
+                "risk_score": min(40 + call_count // 10, 90),
+                "label": f"{call_count} calls in {window_sec}s — unusual automation rate",
+                "severity": "high" if call_count > 200 else "medium",
+            })
+            overall_risk = max(overall_risk, min(40 + call_count // 10, 90))
+
+        # 3. Repeated denied calls — possible probing
+        denied_count = sum(1 for r in rows if r["decision"] == "denied")
+        if denied_count >= 3:
+            anomalies.append({
+                "type": "repeated_denials",
+                "denied_count": denied_count,
+                "total_calls": call_count,
+                "risk_score": min(30 + denied_count * 10, 80),
+                "label": f"{denied_count} denied calls — possible policy probe or brute force",
+                "severity": "high" if denied_count >= 5 else "medium",
+            })
+            overall_risk = max(overall_risk, min(30 + denied_count * 10, 80))
+
+        # 4. Diverse tool access in short window — reconnaissance pattern
+        unique_tools = len(set(tool_sequence))
+        if unique_tools >= 8 and window_sec <= 120:
+            anomalies.append({
+                "type": "broad_reconnaissance",
+                "unique_tools_accessed": unique_tools,
+                "window_seconds": window_sec,
+                "risk_score": 55,
+                "label": f"{unique_tools} different tools in {window_sec}s — broad recon pattern",
+                "severity": "medium",
+            })
+            overall_risk = max(overall_risk, 55)
+
+        # 5. High avg risk score
+        if rows:
+            avg_risk = sum(r["risk_score"] or 0 for r in rows) / len(rows)
+            if avg_risk >= 60:
+                anomalies.append({
+                    "type": "elevated_avg_risk",
+                    "avg_risk_score": round(avg_risk, 1),
+                    "risk_score": int(avg_risk),
+                    "label": f"Average risk score {avg_risk:.1f} — agent consistently making risky calls",
+                    "severity": "high" if avg_risk >= 75 else "medium",
+                })
+                overall_risk = max(overall_risk, int(avg_risk))
+
+        clean = len(anomalies) == 0
+        return {
+            "agent_id": agent_id,
+            "window_seconds": window_sec,
+            "clean": clean,
+            "anomaly_count": len(anomalies),
+            "anomalies": anomalies,
+            "overall_risk_score": overall_risk,
+            "call_count": call_count,
+            "tool_sequence": tool_sequence[-10:],  # Letzte 10
+            "unique_tools": len(set(tool_sequence)),
+            "sensitivity": sensitivity,
+            "recommendation": (
+                "No anomalies detected" if clean else
+                f"ALERT — {len(anomalies)} anomalous pattern(s) detected"
+            ),
+            "timestamp": ts(),
+        }
+    finally:
+        conn.close()
+
+
+# ── TOOL 14: scope_check ─────────────────────────────────────────────────────
+
+async def handle_scope_check(args: dict) -> dict:
+    """
+    Check if an agent/session has the required scope to call a tool.
+    Supports role-based scope expansion (admin, compliance_officer, trader...).
+    Returns has_scope=true/false with missing scopes and role suggestions.
+    """
+    agent_id   = args.get("agent_id", "unknown")
+    tool_name  = args.get("tool_name", "")
+    role       = args.get("role", "readonly")
+    scopes     = args.get("scopes", [])  # Explicit scopes (overrides role)
+    session_id = args.get("session_id")
+
+    if not tool_name:
+        return {"error": "tool_name required"}
+
+    # Resolve scopes: explicit > session > role
+    effective_scopes = set(scopes)
+
+    # Add role-based scopes
+    role_scopes = SCOPE_HIERARCHY.get(role, [])
+    effective_scopes.update(role_scopes)
+
+    # Check session scopes
+    if session_id and session_id in _sessions:
+        sess = _sessions[session_id]
+        effective_scopes.update(sess.get("scopes", []))
+
+    # Required scope for this tool
+    required_scope = TOOL_SCOPES.get(tool_name)
+
+    if required_scope is None:
+        # Tool needs no scope — public
+        return {
+            "agent_id": agent_id,
+            "tool_name": tool_name,
+            "has_scope": True,
+            "required_scope": None,
+            "effective_scopes": sorted(effective_scopes),
+            "reason": "Tool requires no scope — publicly accessible",
+            "timestamp": ts(),
+        }
+
+    has_scope = required_scope in effective_scopes
+
+    # Find which roles would grant access
+    granting_roles = [
+        r for r, ss in SCOPE_HIERARCHY.items()
+        if required_scope in ss
+    ]
+
+    # Log scope denial
+    if not has_scope:
+        conn = get_db()
+        try:
+            req_id = make_request_id()
+            conn.execute("""
+                INSERT INTO audit_log
+                (request_id, agent_id, tool_name, risk_score, decision, reason, created_at, signature)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (req_id, agent_id, tool_name, 30, "denied",
+                  f"scope_denied: required={required_scope} effective={sorted(effective_scopes)[:3]}",
+                  ts(), sign_entry({"agent_id": agent_id, "tool_name": tool_name})))
+            conn.commit()
+        finally:
+            conn.close()
+
+    return {
+        "agent_id": agent_id,
+        "tool_name": tool_name,
+        "has_scope": has_scope,
+        "required_scope": required_scope,
+        "effective_scopes": sorted(effective_scopes),
+        "current_role": role,
+        "missing_scope": required_scope if not has_scope else None,
+        "granting_roles": granting_roles,
+        "recommendation": (
+            "Scope granted — proceed" if has_scope else
+            f"Access denied — add scope '{required_scope}' or use role: {granting_roles[:2]}"
+        ),
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 15: session_validate ────────────────────────────────────────────────
+
+async def handle_session_validate(args: dict) -> dict:
+    """
+    Create, validate, or invalidate agent sessions.
+    Sessions carry: agent_id, tenant, scopes, expiry, call budget.
+    Actions: create | validate | invalidate | info
+    """
+    action     = args.get("action", "validate")  # create|validate|invalidate|info
+    session_id = args.get("session_id", "")
+    agent_id   = args.get("agent_id", "unknown")
+    tenant_id  = args.get("tenant_id", DEFAULT_TENANT)
+    role       = args.get("role", "readonly")
+    scopes     = args.get("scopes", [])
+    ttl_sec    = int(args.get("ttl_seconds", 3600))  # default 1 hour
+    call_budget = int(args.get("call_budget", 1000))  # max calls in session
+
+    now = datetime.now(timezone.utc)
+
+    if action == "create":
+        new_sid = make_request_id()
+        expires_at = (now + timedelta(seconds=ttl_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Merge role scopes + explicit scopes
+        role_scopes = SCOPE_HIERARCHY.get(role, [])
+        all_scopes  = list(set(scopes) | set(role_scopes))
+
+        _sessions[new_sid] = {
+            "session_id":  new_sid,
+            "agent_id":    agent_id,
+            "tenant_id":   tenant_id,
+            "role":        role,
+            "scopes":      all_scopes,
+            "created_at":  now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expires_at":  expires_at,
+            "call_budget": call_budget,
+            "calls_made":  0,
+            "valid":       True,
+        }
+        return {
+            "action": "created",
+            "session_id": new_sid,
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+            "role": role,
+            "scopes": all_scopes,
+            "expires_at": expires_at,
+            "call_budget": call_budget,
+            "valid": True,
+            "timestamp": ts(),
+        }
+
+    if action == "validate":
+        if not session_id:
+            return {"valid": False, "reason": "session_id required"}
+        sess = _sessions.get(session_id)
+        if not sess:
+            return {"valid": False, "session_id": session_id,
+                    "reason": "Session not found", "timestamp": ts()}
+
+        # Check expiry
+        expires = datetime.fromisoformat(sess["expires_at"].replace("Z", "+00:00"))
+        if now > expires:
+            sess["valid"] = False
+            return {"valid": False, "session_id": session_id,
+                    "reason": "Session expired", "expired_at": sess["expires_at"],
+                    "timestamp": ts()}
+
+        # Check call budget
+        if sess["calls_made"] >= sess["call_budget"]:
+            sess["valid"] = False
+            return {"valid": False, "session_id": session_id,
+                    "reason": f"Call budget exhausted ({sess['call_budget']} calls)",
+                    "timestamp": ts()}
+
+        # Increment call counter
+        sess["calls_made"] += 1
+        remaining_calls = sess["call_budget"] - sess["calls_made"]
+        remaining_sec   = int((expires - now).total_seconds())
+
+        return {
+            "valid": True,
+            "session_id": session_id,
+            "agent_id": sess["agent_id"],
+            "tenant_id": sess["tenant_id"],
+            "role": sess["role"],
+            "scopes": sess["scopes"],
+            "calls_made": sess["calls_made"],
+            "calls_remaining": remaining_calls,
+            "expires_in_seconds": remaining_sec,
+            "expires_at": sess["expires_at"],
+            "timestamp": ts(),
+        }
+
+    if action == "invalidate":
+        if session_id in _sessions:
+            _sessions[session_id]["valid"] = False
+            del _sessions[session_id]
+            return {"action": "invalidated", "session_id": session_id, "timestamp": ts()}
+        return {"action": "not_found", "session_id": session_id, "timestamp": ts()}
+
+    if action == "info":
+        return {
+            "active_sessions": len(_sessions),
+            "sessions": [
+                {k: v for k, v in s.items() if k != "scopes"}
+                for s in list(_sessions.values())[:10]
+            ],
+            "timestamp": ts(),
+        }
+
+    return {"error": f"Unknown action: {action}. Use: create|validate|invalidate|info"}
+
+
+# ── TOOL 16: tenant_policy_check ─────────────────────────────────────────────
+
+async def handle_tenant_policy_check(args: dict) -> dict:
+    """
+    Evaluate tenant-specific policy constraints.
+    Tenants can have different tool allowlists, spend limits,
+    rate limits, and compliance requirements.
+    Multi-tenant governance: one AgentGuard, many tenants.
+    """
+    tenant_id  = args.get("tenant_id", DEFAULT_TENANT)
+    agent_id   = args.get("agent_id", "unknown")
+    tool_name  = args.get("tool_name", "")
+    action     = args.get("action", "check")  # check | register | list
+
+    # Built-in tenant configurations (Production: aus DB)
+    TENANT_CONFIGS = {
+        "default": {
+            "name": "Default Tenant",
+            "allowed_tools": None,  # None = alle erlaubt
+            "blocked_tools": ["wallet_transfer", "wire_transfer"],
+            "max_risk_score": 70,
+            "requires_mfa_above": 60,
+            "spend_limit_per_day": 100_000,
+            "compliance_frameworks": [],
+            "rate_limit_per_minute": 200,
+        },
+        "fintech_eu": {
+            "name": "EU FinTech Tenant",
+            "allowed_tools": None,
+            "blocked_tools": [],
+            "max_risk_score": 60,
+            "requires_mfa_above": 40,
+            "spend_limit_per_day": 500_000,
+            "compliance_frameworks": ["MiCA", "DORA", "AMLD6"],
+            "rate_limit_per_minute": 500,
+            "required_scopes": ["compliance:read"],
+        },
+        "defi_protocol": {
+            "name": "DeFi Protocol Tenant",
+            "allowed_tools": None,
+            "blocked_tools": ["wire_transfer"],
+            "max_risk_score": 80,
+            "requires_mfa_above": 75,
+            "spend_limit_per_day": 10_000_000,
+            "compliance_frameworks": ["MiCA"],
+            "rate_limit_per_minute": 1000,
+        },
+        "enterprise_read": {
+            "name": "Enterprise Read-Only Tenant",
+            "allowed_tools": [t for t, s in TOOL_SCOPES.items()
+                               if s in (None, "blockchain:read", "audit:read",
+                                        "compliance:read", "monitor:read")],
+            "blocked_tools": ["payment_execute", "wallet_transfer", "wire_transfer",
+                               "audit_log_write"],
+            "max_risk_score": 30,
+            "requires_mfa_above": 20,
+            "spend_limit_per_day": 0,
+            "compliance_frameworks": [],
+            "rate_limit_per_minute": 100,
+        },
+    }
+
+    if action == "list":
+        return {
+            "tenants": [
+                {"id": tid, "name": cfg["name"],
+                 "frameworks": cfg.get("compliance_frameworks", [])}
+                for tid, cfg in TENANT_CONFIGS.items()
+            ],
+            "timestamp": ts(),
+        }
+
+    config = TENANT_CONFIGS.get(tenant_id, TENANT_CONFIGS["default"])
+
+    if action == "check" and tool_name:
+        violations = []
+        warnings   = []
+
+        # Blocked tools
+        if tool_name in config.get("blocked_tools", []):
+            violations.append(f"Tool '{tool_name}' is blocked for tenant '{tenant_id}'")
+
+        # Allowed tools allowlist (if set)
+        allowed = config.get("allowed_tools")
+        if allowed is not None and tool_name not in allowed:
+            violations.append(f"Tool '{tool_name}' not in tenant allowlist")
+
+        # Required scopes
+        required_scope = config.get("required_scopes", [])
+        if required_scope:
+            warnings.append(f"Tenant requires scopes: {required_scope}")
+
+        allowed_result = len(violations) == 0
+        return {
+            "tenant_id": tenant_id,
+            "tenant_name": config["name"],
+            "agent_id": agent_id,
+            "tool_name": tool_name,
+            "allowed": allowed_result,
+            "violations": violations,
+            "warnings": warnings,
+            "tenant_limits": {
+                "max_risk_score": config["max_risk_score"],
+                "requires_mfa_above": config["requires_mfa_above"],
+                "spend_limit_per_day": config["spend_limit_per_day"],
+                "rate_limit_per_minute": config["rate_limit_per_minute"],
+            },
+            "compliance_frameworks": config.get("compliance_frameworks", []),
+            "timestamp": ts(),
+        }
+
+    # action == "check" without tool_name → return tenant info
+    return {
+        "tenant_id": tenant_id,
+        "config": config,
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 17: threat_intel_check ──────────────────────────────────────────────
+
+async def handle_threat_intel_check(args: dict) -> dict:
+    """
+    Check entities (wallet addresses, IPs, domains, agent IDs) against
+    threat intelligence: known malicious addresses, high-risk entities,
+    sanctioned wallets (OFAC-style), suspicious behavioral patterns.
+    Returns threat_level: none | low | medium | high | critical.
+    """
+    entity     = args.get("entity", "").lower().strip()
+    entity_type = args.get("entity_type", "auto")  # auto|address|ip|domain|agent_id
+    agent_id   = args.get("agent_id", "unknown")
+
+    if not entity:
+        return {"error": "entity required (address, IP, domain, or agent_id)"}
+
+    # Auto-detect entity type
+    if entity_type == "auto":
+        if entity.startswith("0x") and len(entity) == 42:
+            entity_type = "eth_address"
+        elif entity.startswith("0x"):
+            entity_type = "address"
+        elif re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", entity):
+            entity_type = "ip"
+        elif "." in entity and not entity.startswith("0x"):
+            entity_type = "domain"
+        else:
+            entity_type = "identifier"
+
+    threats = []
+    risk_score = 0
+
+    # ── Known bad patterns (simplified OFAC/FATF style) ─────────────────────
+    SANCTIONED_FRAGMENTS = [
+        "tornado",      # Tornado Cash
+        "0x00000000",   # Null/burn addresses
+        "mixer",        # Coin mixers
+        "darkweb",      # Dark web services
+    ]
+    SUSPICIOUS_DOMAINS = [
+        "tempmail", "guerrillamail", "mailnull", "sharklasers",
+        "10minutemail", "throwam", "yopmail",
+    ]
+    HIGH_RISK_RANGES = [
+        "10.0.", "192.168.", "172.16.", "127.0.",  # Private IP (nicht direkt böse aber suspekt in Agent-Kontext)
+    ]
+
+    # Sanction check
+    for fragment in SANCTIONED_FRAGMENTS:
+        if fragment in entity:
+            threats.append({
+                "type": "sanctions_match",
+                "match": fragment,
+                "severity": "critical",
+                "description": f"Entity contains sanctioned/high-risk pattern: '{fragment}'",
+                "source": "Internal Sanctions List",
+            })
+            risk_score += 80
+
+    # Disposable email / suspicious domain
+    if entity_type == "domain":
+        for d in SUSPICIOUS_DOMAINS:
+            if d in entity:
+                threats.append({
+                    "type": "disposable_service",
+                    "match": d,
+                    "severity": "medium",
+                    "description": "Disposable/temporary service domain",
+                    "source": "Disposable Service List",
+                })
+                risk_score += 30
+
+    # Private IP check (suspicious for external agent calls)
+    if entity_type == "ip":
+        for rng in HIGH_RISK_RANGES:
+            if entity.startswith(rng):
+                threats.append({
+                    "type": "private_ip",
+                    "match": rng,
+                    "severity": "low",
+                    "description": "Private/loopback IP range — verify this is expected",
+                    "source": "Network Policy",
+                })
+                risk_score += 10
+
+    # Behavioral threat: check if entity appears frequently in denied audit entries
+    conn = get_db()
+    try:
+        since_1h = (datetime.now(timezone.utc) - timedelta(hours=1)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        denied_as_agent = conn.execute("""
+            SELECT COUNT(*) FROM audit_log
+            WHERE agent_id=? AND decision='denied' AND created_at>=?
+        """, (entity, since_1h)).fetchone()[0]
+
+        if denied_as_agent >= 5:
+            threats.append({
+                "type": "behavioral_threat",
+                "denied_count": denied_as_agent,
+                "severity": "high" if denied_as_agent >= 10 else "medium",
+                "description": f"Entity has {denied_as_agent} denied calls in last hour — possible adversarial agent",
+                "source": "AgentGuard Behavioral Analysis",
+            })
+            risk_score += min(denied_as_agent * 5, 50)
+
+    finally:
+        conn.close()
+
+    risk_score = min(risk_score, 100)
+    threat_level = (
+        "critical" if risk_score >= 80 else
+        "high"     if risk_score >= 60 else
+        "medium"   if risk_score >= 30 else
+        "low"      if risk_score >= 10 else
+        "none"
+    )
+
+    return {
+        "entity": entity,
+        "entity_type": entity_type,
+        "agent_id": agent_id,
+        "threat_level": threat_level,
+        "risk_score": risk_score,
+        "threat_count": len(threats),
+        "threats": threats,
+        "clean": len(threats) == 0,
+        "recommendation": (
+            f"BLOCK — entity is {threat_level} risk" if risk_score >= 60 else
+            f"WARN — {len(threats)} indicator(s) found" if threats else
+            "Entity appears clean"
+        ),
+        "timestamp": ts(),
+    }
+
+
+
 TOOLS = [
     {
         "name": "policy_preflight",
@@ -1868,6 +2566,73 @@ TOOLS = [
         "handler": handle_replay_guard_check,
     },
 
+    {
+        "name": "cross_tool_anomaly_check",
+        "description": (
+            "Detect anomalous tool usage patterns across an agent recent history. "
+            "Checks risky tool combinations (AML-then-payment, wallet-recon-then-transfer), "
+            "high call frequency, repeated denials, broad reconnaissance, elevated risk scores."
+        ),
+        "inputSchema": {"type": "object",
+            "properties": {
+                "agent_id":       {"type": "string", "description": "Agent to analyze"},
+                "window_seconds": {"type": "integer", "description": "Lookback seconds (default 300)", "default": 300},
+                "sensitivity":    {"type": "string", "description": "low|medium|high", "default": "medium"},
+            }, "required": ["agent_id"]},
+        "handler": handle_cross_tool_anomaly_check,
+    },
+    {
+        "name": "scope_check",
+        "description": "Check if agent has required scope for a tool. Roles: admin, compliance_officer, trader, auditor, developer, readonly. Returns has_scope + missing scope + granting roles.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "agent_id":   {"type": "string"},
+                "tool_name":  {"type": "string"},
+                "role":       {"type": "string", "default": "readonly"},
+                "scopes":     {"type": "array", "items": {"type": "string"}},
+                "session_id": {"type": "string"},
+            }, "required": ["tool_name"]},
+        "handler": handle_scope_check,
+    },
+    {
+        "name": "session_validate",
+        "description": "Create/validate/invalidate agent sessions with role, scopes, TTL and call budget. Actions: create|validate|invalidate|info.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "action":      {"type": "string", "default": "validate"},
+                "session_id":  {"type": "string"},
+                "agent_id":    {"type": "string"},
+                "tenant_id":   {"type": "string", "default": "default"},
+                "role":        {"type": "string", "default": "readonly"},
+                "scopes":      {"type": "array", "items": {"type": "string"}},
+                "ttl_seconds": {"type": "integer", "default": 3600},
+                "call_budget": {"type": "integer", "default": 1000},
+            }, "required": ["action"]},
+        "handler": handle_session_validate,
+    },
+    {
+        "name": "tenant_policy_check",
+        "description": "Multi-tenant governance. Tenants: default, fintech_eu (MiCA/DORA), defi_protocol, enterprise_read. Checks tool blocklists, max risk scores, spend limits. Actions: check|list.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "tenant_id": {"type": "string", "default": "default"},
+                "agent_id":  {"type": "string"},
+                "tool_name": {"type": "string"},
+                "action":    {"type": "string", "default": "check"},
+            }, "required": []},
+        "handler": handle_tenant_policy_check,
+    },
+    {
+        "name": "threat_intel_check",
+        "description": "Check entity against threat intelligence. Auto-detects ETH addresses, IPs, domains. Checks sanctions (Tornado Cash), disposable services, behavioral analysis from audit log. Returns threat_level: none|low|medium|high|critical.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "entity":      {"type": "string", "description": "Address, IP, domain or agent_id to check"},
+                "entity_type": {"type": "string", "default": "auto"},
+                "agent_id":    {"type": "string"},
+            }, "required": ["entity"]},
+        "handler": handle_threat_intel_check,
+    },
 ]
 
 TOOL_MAP = {t["name"]: t for t in TOOLS}

@@ -78,6 +78,38 @@ Agent wants to call: payment_execute({amount: 5000})
 | `replay_guard_check` | Detect replay attacks via SHA256 fingerprint (agent+tool+args). Configurable window (default 5 min). Returns duplicate count + first/last seen. |
 
 
+
+## Tools — Welle 3: Governance & Threat Intelligence (5)
+
+| Tool | Description |
+|------|-------------|
+| `cross_tool_anomaly_check` | Detect anomalous patterns: risky combos (wallet-recon→transfer, AML→payment), high frequency, repeated denials (policy probing), broad reconnaissance, elevated avg risk score. |
+| `scope_check` | Role-based scope control. Roles: admin, compliance_officer, trader, auditor, developer, readonly. Returns has_scope, missing scope, granting roles. Logs denials. |
+| `session_validate` | Full session lifecycle: create (TTL + call budget), validate (increment counter), invalidate, info. Sessions carry role, scopes, tenant, expiry. |
+| `tenant_policy_check` | Multi-tenant governance. Built-in tenants: default, fintech_eu (MiCA/DORA/AMLD6), defi_protocol, enterprise_read. Per-tenant blocklists, risk limits, spend caps. |
+| `threat_intel_check` | Entity threat intelligence. Auto-detects ETH addresses, IPs, domains. Checks sanctions (Tornado Cash, mixers), disposable services, behavioral analysis from audit log. |
+
+### Built-in Tenants
+
+| Tenant | Max Risk | Spend/Day | Frameworks |
+|--------|----------|-----------|------------|
+| `default` | 70 | 100,000 | — |
+| `fintech_eu` | 60 | 500,000 | MiCA, DORA, AMLD6 |
+| `defi_protocol` | 80 | 10,000,000 | MiCA |
+| `enterprise_read` | 30 | 0 | — |
+
+### Built-in Roles & Scopes
+
+| Role | Scopes |
+|------|--------|
+| `admin` | All scopes |
+| `compliance_officer` | audit:read, compliance:read, blockchain:read, security:scan |
+| `trader` | blockchain:read, payment:check, payment:execute, audit:read |
+| `auditor` | audit:read, audit:write, compliance:read, monitor:read |
+| `developer` | blockchain:read, security:scan, audit:read, monitor:read |
+| `readonly` | blockchain:read, audit:read |
+
+
 ## Built-in Policies (7 Default)
 
 | Policy | Condition | Action |
