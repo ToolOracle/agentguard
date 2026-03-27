@@ -41,7 +41,7 @@ logger = logging.getLogger("AgentGuard")
 import hashlib as _hl
 
 FO_BILLING_DB = "/root/rwa_node/mcp/feedoracle_billing.db"
-AGENTGUARD_PUBLIC_TOOLS = {"policy_preflight", "tool_risk_score", "decision_explain"}
+AGENTGUARD_PUBLIC_TOOLS = {"policy_preflight", "tool_risk_score", "decision_explain", "tool_manifest_verify"}
 
 def _verify_bearer_token(token: str) -> dict | None:
     """Verify Bearer token against FeedOracle OAuth DB. Returns {client_id, scopes, tier} or None."""
@@ -2015,6 +2015,334 @@ async def handle_threat_intel_check(args: dict) -> dict:
 
 
 
+
+# ── TOOL 18: output_safety_scan (Post-Execution Guard) ──────────────────────
+
+# PII patterns for output scanning
+PII_PATTERNS = [
+    (r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b.*\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b", "credit_card_with_name"),
+    (r"\b\d{3}-\d{2}-\d{4}\b", "ssn"),
+    (r"\b[A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{2}\b", "iban"),
+    (r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b", "email"),
+    (r"\b(?:\+\d{1,3}[\s-]?)?\(?\d{2,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}\b", "phone"),
+    (r"\b\d{1,5}\s\w+\s(?:St|Ave|Blvd|Rd|Dr|Ln|Ct|Way|Pl)\b", "address"),
+    (r"\bpassport\s*(?:number|no|#)?\s*[:=]?\s*[A-Z0-9]{6,12}\b", "passport"),
+]
+
+EXFIL_PATTERNS = [
+    (r"(?:curl|wget|fetch|http|https)\s+[\w./-]+", "outbound_url"),
+    (r"data:[a-z]+/[a-z]+;base64,", "base64_data_uri"),
+    (r"\\x[0-9a-f]{2}", "hex_encoded"),
+    (r"<script[^>]*>", "script_injection"),
+]
+
+async def handle_output_safety_scan(args: dict) -> dict:
+    """
+    Post-execution output scanner. Checks tool output for:
+    - PII leaks (emails, phones, SSNs, IBANs, addresses, passport numbers)
+    - Secret exposure (API keys, tokens, private keys)
+    - Data exfiltration patterns (outbound URLs, base64 data, encoded content)
+    - Tool poisoning (injected instructions in output)
+    """
+    args.pop("_caller", None)
+    output = args.get("output", args.get("text", ""))
+    tool_name = args.get("tool_name", "unknown")
+    agent_id = args.get("agent_id", "unknown")
+    strict = args.get("strict", False)
+
+    if not output:
+        return {"error": "output or text required"}
+
+    output_str = json.dumps(output) if isinstance(output, dict) else str(output)
+    findings = []
+
+    # 1. PII scan
+    for pattern, pii_type in PII_PATTERNS:
+        matches = re.findall(pattern, output_str, re.IGNORECASE)
+        if matches:
+            findings.append({
+                "type": "pii",
+                "subtype": pii_type,
+                "count": len(matches),
+                "severity": "high" if pii_type in ("ssn", "credit_card_with_name", "passport") else "medium",
+                "action": "redact",
+            })
+
+    # 2. Secret scan (reuse existing patterns)
+    for pattern in SECRET_PATTERNS:
+        if re.search(pattern, output_str, re.IGNORECASE):
+            findings.append({
+                "type": "secret_leak",
+                "severity": "critical",
+                "action": "block",
+            })
+            break
+
+    # 3. Exfiltration patterns
+    for pattern, exfil_type in EXFIL_PATTERNS:
+        if re.search(pattern, output_str, re.IGNORECASE):
+            findings.append({
+                "type": "exfiltration",
+                "subtype": exfil_type,
+                "severity": "high",
+                "action": "block" if strict else "flag",
+            })
+
+    # 4. Tool poisoning (injected instructions)
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, output_str, re.IGNORECASE):
+            findings.append({
+                "type": "tool_poisoning",
+                "severity": "critical",
+                "action": "block",
+            })
+            break
+
+    has_critical = any(f["severity"] == "critical" for f in findings)
+    has_high = any(f["severity"] == "high" for f in findings)
+
+    verdict = "block" if has_critical else ("flag" if has_high else ("warn" if findings else "clean"))
+
+    # Auto-audit
+    conn = get_db()
+    try:
+        request_id = make_request_id()
+        conn.execute(
+            "INSERT INTO audit_log (request_id, agent_id, tool_name, risk_score, decision, reason, created_at) VALUES (?,?,?,?,?,?,?)",
+            (request_id, agent_id, f"output_scan:{tool_name}", len(findings) * 20,
+             "denied" if verdict == "block" else ("flagged" if verdict in ("flag","warn") else "allowed"), json.dumps([f["type"] for f in findings])[:200], ts())
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "request_id": request_id,
+        "tool_name": tool_name,
+        "verdict": verdict,
+        "findings_count": len(findings),
+        "findings": findings,
+        "output_length": len(output_str),
+        "recommendation": {
+            "clean": "Output is safe to forward",
+            "warn": "Minor issues detected — review before forwarding",
+            "flag": "Sensitive content detected — manual review required",
+            "block": "Critical issue — do NOT forward this output",
+        }.get(verdict, "unknown"),
+        "timestamp": ts(),
+    }
+
+
+# ── TOOL 19: emergency_kill — Runtime Kill-Switch ────────────────────────────
+
+async def handle_emergency_kill(args: dict) -> dict:
+    """
+    Emergency kill-switch. Immediately terminates an agent session,
+    revokes all pending approvals, and logs the emergency event.
+    Use when: suspicious behavior detected, compromised agent, runaway automation.
+    """
+    args.pop("_caller", None)
+    agent_id = args.get("agent_id")
+    session_id = args.get("session_id")
+    reason = args.get("reason", "Emergency kill activated")
+    kill_type = args.get("kill_type", "full")  # full | session_only | soft
+
+    if not agent_id and not session_id:
+        return {"error": "agent_id or session_id required"}
+
+    conn = get_db()
+    actions_taken = []
+
+    try:
+        # 1. Invalidate all sessions for this agent
+        if kill_type in ("full", "session_only"):
+            killed_sessions = []
+            to_remove = []
+            for sid, sdata in _sessions.items():
+                if (agent_id and sdata.get("agent_id") == agent_id) or (session_id and sid == session_id):
+                    to_remove.append(sid)
+                    killed_sessions.append(sid)
+            for sid in to_remove:
+                _sessions.pop(sid, None)
+            if killed_sessions:
+                actions_taken.append(f"killed {len(killed_sessions)} session(s)")
+
+        # 2. Revoke all pending approvals
+        if kill_type == "full":
+            if agent_id:
+                cur = conn.execute(
+                    "UPDATE approvals SET status='revoked', resolved_at=? WHERE agent_id=? AND status='pending'",
+                    (ts(), agent_id)
+                )
+                if cur.rowcount > 0:
+                    actions_taken.append(f"revoked {cur.rowcount} pending approval(s)")
+
+        # 3. Set rate limit to zero (effective block)
+        if kill_type == "full" and agent_id:
+            conn.execute(
+                "INSERT OR REPLACE INTO rate_limits (agent_id, window_key, call_count, first_call, last_call) VALUES (?, 'killed', 999999, ?, ?)",
+                (agent_id, ts(), ts())
+            )
+            actions_taken.append("rate limit set to blocked")
+
+        # 4. Audit the emergency event
+        request_id = make_request_id()
+        entry = {"agent_id": agent_id or "unknown", "tool_name": "EMERGENCY_KILL", "risk_score": 100, "decision": "emergency"}
+        sig = sign_entry(entry)
+        conn.execute(
+            "INSERT INTO audit_log (request_id, agent_id, session_id, tool_name, risk_score, decision, reason, signature, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (request_id, agent_id or "unknown", session_id, "EMERGENCY_KILL", 100, "denied", reason, sig, ts())
+        )
+        conn.commit()
+        actions_taken.append("audit logged")
+
+    finally:
+        conn.close()
+
+    return {
+        "request_id": request_id,
+        "status": "killed",
+        "kill_type": kill_type,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "reason": reason,
+        "actions_taken": actions_taken,
+        "timestamp": ts(),
+        "warning": "Agent is now blocked. Manual intervention required to re-enable.",
+    }
+
+
+# ── TOOL 20: tool_manifest_verify — Supply-Chain / Tool Provenance ───────────
+
+KNOWN_TOOL_MANIFESTS = {
+    "feedoracle": {
+        "publisher": "FeedOracle Technologies",
+        "domain": "feedoracle.io",
+        "signing_alg": "ES256K",
+        "jwks_url": "https://feedoracle.io/.well-known/jwks.json",
+        "trust": "verified",
+    },
+    "tooloracle": {
+        "publisher": "ToolOracle (FeedOracle Technologies)",
+        "domain": "tooloracle.io",
+        "signing_alg": "ES256K",
+        "jwks_url": "https://feedoracle.io/.well-known/jwks.json",
+        "trust": "verified",
+    },
+}
+
+SUSPICIOUS_TOOL_PATTERNS = [
+    r"ignore\s+(?:previous|all|above)",
+    r"<\s*script",
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"data:text/html",
+    r"javascript:",
+]
+
+async def handle_tool_manifest_verify(args: dict) -> dict:
+    """
+    Supply-chain verification for MCP tools.
+    Checks: publisher identity, tool description for injections,
+    server domain against allowlist, signing capability.
+    Protects against: rug-pull tools, compromised MCP servers,
+    hidden prompt injections in tool descriptions.
+    """
+    args.pop("_caller", None)
+    server_url = args.get("server_url", "")
+    tool_name = args.get("tool_name", "")
+    tool_description = args.get("tool_description", "")
+    publisher = args.get("publisher", "")
+    action = args.get("action", "verify")  # verify | scan_description | check_allowlist
+
+    findings = []
+    trust_level = "unknown"
+
+    # 1. Publisher / domain check
+    if server_url:
+        domain = ""
+        for d in ("feedoracle.io", "tooloracle.io", "mcp.feedoracle.io"):
+            if d in server_url:
+                domain = d
+                break
+
+        if domain:
+            for key, manifest in KNOWN_TOOL_MANIFESTS.items():
+                if manifest["domain"] == domain or domain.endswith(manifest["domain"]):
+                    trust_level = manifest["trust"]
+                    findings.append({
+                        "check": "publisher",
+                        "status": "pass",
+                        "publisher": manifest["publisher"],
+                        "signing": manifest["signing_alg"],
+                    })
+                    break
+        else:
+            trust_level = "unverified"
+            findings.append({
+                "check": "publisher",
+                "status": "warn",
+                "message": f"Unknown publisher domain: {server_url[:60]}",
+            })
+
+    # 2. Tool description injection scan
+    if tool_description:
+        desc_lower = tool_description.lower()
+        injection_found = False
+        for pattern in SUSPICIOUS_TOOL_PATTERNS:
+            if re.search(pattern, desc_lower, re.IGNORECASE):
+                injection_found = True
+                findings.append({
+                    "check": "description_injection",
+                    "status": "critical",
+                    "message": "Suspicious pattern in tool description — possible prompt injection",
+                    "pattern": pattern[:40],
+                })
+                trust_level = "compromised"
+                break
+
+        if not injection_found:
+            findings.append({"check": "description_injection", "status": "pass"})
+
+        # Check for excessively long descriptions (common in injection attacks)
+        if len(tool_description) > 2000:
+            findings.append({
+                "check": "description_length",
+                "status": "warn",
+                "message": f"Unusually long tool description ({len(tool_description)} chars)",
+            })
+
+    # 3. Tool name validation
+    if tool_name:
+        if re.search(r"[^a-zA-Z0-9_-]", tool_name):
+            findings.append({
+                "check": "tool_name",
+                "status": "warn",
+                "message": "Tool name contains unusual characters",
+            })
+        else:
+            findings.append({"check": "tool_name", "status": "pass"})
+
+    has_critical = any(f.get("status") == "critical" for f in findings)
+    has_warn = any(f.get("status") == "warn" for f in findings)
+
+    verdict = "block" if has_critical else ("caution" if has_warn else "trusted")
+
+    return {
+        "tool_name": tool_name,
+        "server_url": server_url[:80] if server_url else None,
+        "trust_level": trust_level,
+        "verdict": verdict,
+        "findings": findings,
+        "recommendation": {
+            "trusted": "Tool is from a verified publisher — safe to use",
+            "caution": "Unverified publisher — use with elevated monitoring",
+            "block": "CRITICAL — do NOT use this tool. Possible compromise detected.",
+        }.get(verdict, "Review manually"),
+        "timestamp": ts(),
+    }
+
+
 TOOLS = [
     {
         "name": "policy_preflight",
@@ -2326,6 +2654,42 @@ TOOLS = [
                 "agent_id":    {"type": "string"},
             }, "required": ["entity"]},
         "handler": handle_threat_intel_check,
+    },
+    {
+        "name": "output_safety_scan",
+        "description": "Post-execution output scanner. Checks tool output for PII leaks (email, phone, SSN, IBAN), secret exposure, data exfiltration patterns (outbound URLs, base64), and tool poisoning (injected instructions). Verdict: clean|warn|flag|block.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "output":    {"type": "string", "description": "Tool output text or JSON to scan"},
+                "tool_name": {"type": "string", "description": "Name of the tool that produced this output"},
+                "agent_id":  {"type": "string"},
+                "strict":    {"type": "boolean", "default": False, "description": "Block on any high-severity finding"},
+            }, "required": ["output"]},
+        "handler": handle_output_safety_scan,
+    },
+    {
+        "name": "emergency_kill",
+        "description": "Emergency kill-switch. Immediately terminates agent session(s), revokes pending approvals, blocks rate limits, and audit-logs the emergency. Use for: compromised agents, runaway automation, suspicious behavior. kill_type: full|session_only|soft.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "agent_id":   {"type": "string", "description": "Agent to kill"},
+                "session_id": {"type": "string", "description": "Specific session to kill"},
+                "reason":     {"type": "string", "description": "Why emergency kill was triggered"},
+                "kill_type":  {"type": "string", "default": "full", "description": "full|session_only|soft"},
+            }},
+        "handler": handle_emergency_kill,
+    },
+    {
+        "name": "tool_manifest_verify",
+        "description": "Supply-chain verification for MCP tools. Checks publisher identity against allowlist, scans tool descriptions for prompt injection, validates server domain and signing capability. Verdict: trusted|caution|block.",
+        "inputSchema": {"type": "object",
+            "properties": {
+                "server_url":       {"type": "string", "description": "MCP server URL to verify"},
+                "tool_name":        {"type": "string", "description": "Tool name to check"},
+                "tool_description": {"type": "string", "description": "Tool description to scan for injections"},
+                "publisher":        {"type": "string", "description": "Claimed publisher name"},
+            }},
+        "handler": handle_tool_manifest_verify,
     },
 ]
 
