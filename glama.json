@@ -1,0 +1,11 @@
+{
+  "name": "AgentGuard",
+  "description": "AI Agent Safety Infrastructure — OAuth/KYA auth, risk scoring, audit trail, kill switch, 20 MCP tools",
+  "repository": "https://github.com/ToolOracle/agentguard",
+  "endpoint": "https://tooloracle.io/agentguard/mcp/",
+  "health": "https://tooloracle.io/agentguard/health",
+  "tools": 20,
+  "license": "MIT",
+  "author": "FeedOracle Technologies",
+  "tags": ["agent-safety", "mcp", "ai-agent", "tooloracle"]
+}
