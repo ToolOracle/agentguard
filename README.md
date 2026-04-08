@@ -1,8 +1,8 @@
 # 🛡️ AgentGuard MCP
 
-**Security, Policy & Audit Layer for AI Agent Tool Execution** — 7 tools | Part of [FeedOracle](https://feedoracle.io) & [ToolOracle](https://tooloracle.io)
+**Security, Policy & Audit Layer for AI Agent Tool Execution** — 20 tools | Part of [FeedOracle](https://feedoracle.io) & [ToolOracle](https://tooloracle.io)
 
-![Tools](https://img.shields.io/badge/MCP_Tools-7-10B898?style=flat-square)
+![Tools](https://img.shields.io/badge/MCP_Tools-20-10B898?style=flat-square)
 ![Status](https://img.shields.io/badge/Status-Live-00C853?style=flat-square)
 ![Backend](https://img.shields.io/badge/Backend-SQLite_WAL-4A90D9?style=flat-square)
 ![Tier](https://img.shields.io/badge/Tier-Free-2196F3?style=flat-square)
